@@ -216,6 +216,7 @@ async fn run_proxy_and_launch(cli: Cli) -> Result<()> {
     let meta = log::SessionMeta {
         session_id: session_id.clone(),
         started_at: OffsetDateTime::now_utc(),
+        ended_at: None,
         claude_argv: cli
             .claude_args
             .iter()
@@ -223,10 +224,22 @@ async fn run_proxy_and_launch(cli: Cli) -> Result<()> {
             .collect(),
         claude_path: claude_path.display().to_string(),
         claude_pid: pid,
+        claude_exit_code: None,
+        claude_session_id: None,
+        claude_version: detect_claude_version(&claude_path),
         proxy_addr: local.to_string(),
         redact: !cli.no_redact,
         host_filter: hosts,
         claudetap_version: env!("CARGO_PKG_VERSION").to_string(),
+        session_dir: Some(session_dir.display().to_string()),
+        ca_cert_path: Some(ca_path.display().to_string()),
+        cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        user: std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok()),
+        hostname: hostname(),
+        os: Some(std::env::consts::OS.to_string()),
+        arch: Some(std::env::consts::ARCH.to_string()),
+        shell: std::env::var("SHELL").ok(),
+        term: std::env::var("TERM").ok(),
     };
     logger.write_meta(&meta).await?;
 
@@ -234,6 +247,15 @@ async fn run_proxy_and_launch(cli: Cli) -> Result<()> {
     // ALWAYS gets us out, even when claude's TUI is hung waiting on a
     // dead network connection and ignoring SIGINT.
     let code = supervise_child(&mut child, pid).await;
+    if let Err(e) = logger
+        .update_meta(|m| {
+            m.ended_at = Some(OffsetDateTime::now_utc());
+            m.claude_exit_code = code;
+        })
+        .await
+    {
+        warn!(error = %e, "updating meta.json on shutdown");
+    }
     eprintln!(
         "\nclaudetap: claude exited (code={}) — session {}\n           logs at {}",
         code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
@@ -286,21 +308,34 @@ async fn run_proxy_only(cli: Cli) -> Result<()> {
 
     let ca_path = paths::ca_cert_path()?;
 
+    let session_dir = paths::session_dir(&session_id)?;
+
     // Write session meta now (no claude child to wait on).
     let meta = log::SessionMeta {
         session_id: session_id.clone(),
         started_at: OffsetDateTime::now_utc(),
+        ended_at: None,
         claude_argv: Vec::new(),
         claude_path: String::new(),
         claude_pid: None,
+        claude_exit_code: None,
+        claude_session_id: None,
+        claude_version: None,
         proxy_addr: local.to_string(),
         redact: !cli.no_redact,
         host_filter: hosts.clone(),
         claudetap_version: env!("CARGO_PKG_VERSION").to_string(),
+        session_dir: Some(session_dir.display().to_string()),
+        ca_cert_path: Some(ca_path.display().to_string()),
+        cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        user: std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok()),
+        hostname: hostname(),
+        os: Some(std::env::consts::OS.to_string()),
+        arch: Some(std::env::consts::ARCH.to_string()),
+        shell: std::env::var("SHELL").ok(),
+        term: std::env::var("TERM").ok(),
     };
     logger.write_meta(&meta).await?;
-
-    let session_dir = paths::session_dir(&session_id)?;
     let banner_text = banner::Banner::new("claudetap · proxy (no child)")
         .row("session", session_id.clone())
         .row("proxy", proxy_url.clone())
@@ -341,6 +376,12 @@ async fn run_proxy_only(cli: Cli) -> Result<()> {
 
     wait_for_shutdown().await;
 
+    if let Err(e) = logger
+        .update_meta(|m| m.ended_at = Some(OffsetDateTime::now_utc()))
+        .await
+    {
+        warn!(error = %e, "updating meta.json on shutdown");
+    }
     eprintln!(
         "\nclaudetap: proxy stopped — session {}\n           logs at {}",
         session_id,
@@ -349,6 +390,60 @@ async fn run_proxy_only(cli: Cli) -> Result<()> {
     proxy_task.abort();
     let _ = proxy_task.await;
     Ok(())
+}
+
+/// Best-effort hostname lookup. Tries libc on unix, falls back to env vars.
+fn hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            if let Ok(s) = std::str::from_utf8(&buf[..nul]) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+}
+
+/// Best-effort: run `<claude_path> --version` with a short timeout and capture
+/// stdout. Returns `None` on any failure (so we never block startup on it).
+fn detect_claude_version(claude_path: &std::path::Path) -> Option<String> {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    let mut child = Command::new(claude_path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Poll for up to ~1.5s.
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Drop a small text file at `~/.claudetap/last-session` so users can find

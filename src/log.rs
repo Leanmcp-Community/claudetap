@@ -46,13 +46,46 @@ pub struct SessionMeta {
     pub session_id: String,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub ended_at: Option<OffsetDateTime>,
     pub claude_argv: Vec<String>,
     pub claude_path: String,
     pub claude_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_exit_code: Option<i32>,
+    /// Claude Code's own session UUID, sniffed from `metadata.user_id` in the
+    /// first Anthropic API request body that contains it. `None` until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_version: Option<String>,
     pub proxy_addr: String,
     pub redact: bool,
     pub host_filter: Vec<String>,
     pub claudetap_version: String,
+    /// Absolute path to this session's directory under `~/.claudetap/sessions/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,6 +163,12 @@ pub struct SessionLogger {
     redact: bool,
     #[allow(dead_code)]
     pub session_id: String,
+    /// Live, in-memory copy of the on-disk `meta.json`. Mutated and rewritten
+    /// when fields like `claude_session_id` or `ended_at` become known.
+    meta: Mutex<Option<SessionMeta>>,
+    /// Set once we've successfully sniffed claude's session id, so we don't
+    /// re-parse every subsequent request body.
+    claude_session_seen: std::sync::atomic::AtomicBool,
 }
 
 impl SessionLogger {
@@ -156,6 +195,8 @@ impl SessionLogger {
             traffic: Mutex::new(traffic),
             redact,
             session_id,
+            meta: Mutex::new(None),
+            claude_session_seen: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -165,7 +206,68 @@ impl SessionLogger {
         tokio::fs::write(&path, &bytes)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
+        *self.meta.lock().await = Some(meta.clone());
         Ok(())
+    }
+
+    /// Apply `f` to the in-memory meta and rewrite `meta.json` if it changed.
+    /// Silently no-ops if `write_meta` was never called.
+    pub async fn update_meta<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut SessionMeta),
+    {
+        let mut guard = self.meta.lock().await;
+        let Some(meta) = guard.as_mut() else {
+            return Ok(());
+        };
+        f(meta);
+        let path = self.dir.join("meta.json");
+        let bytes = serde_json::to_vec_pretty(meta)?;
+        tokio::fs::write(&path, &bytes)
+            .await
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Try to extract Claude Code's own session UUID from a request body.
+    ///
+    /// Claude Code embeds it in `metadata.user_id` on Anthropic API calls,
+    /// formatted roughly as `user_<accounthash>_account__session_<uuid>`.
+    /// We do a cheap once-only scan: parse JSON, walk to `metadata.user_id`,
+    /// then pluck out the first UUID-shaped substring.
+    pub async fn observe_request_body(&self, body: &[u8]) {
+        use std::sync::atomic::Ordering;
+        if self.claude_session_seen.load(Ordering::Relaxed) {
+            return;
+        }
+        if body.is_empty() || body.len() > 2 * 1024 * 1024 {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return;
+        };
+        let Some(user_id) = v
+            .get("metadata")
+            .and_then(|m| m.get("user_id"))
+            .and_then(|u| u.as_str())
+        else {
+            return;
+        };
+        let Some(uuid) = find_uuid(user_id) else {
+            return;
+        };
+        if self
+            .claude_session_seen
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        if let Err(e) = self
+            .update_meta(|m| m.claude_session_id = Some(uuid))
+            .await
+        {
+            tracing::warn!(error = %e, "updating meta.json with claude_session_id");
+        }
     }
 
     #[allow(dead_code)]
@@ -285,6 +387,41 @@ async fn write_append(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("opening {}", path.display()))?;
     f.write_all(bytes).await?;
     Ok(())
+}
+
+/// Find the first UUID-shaped substring (8-4-4-4-12 lowercase hex) inside `s`.
+fn find_uuid(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 36 {
+        return None;
+    }
+    let groups = [8usize, 4, 4, 4, 12];
+    'outer: for start in 0..=bytes.len().saturating_sub(36) {
+        let mut idx = start;
+        for (gi, &n) in groups.iter().enumerate() {
+            for _ in 0..n {
+                if idx >= bytes.len() {
+                    continue 'outer;
+                }
+                let c = bytes[idx];
+                let is_hex = c.is_ascii_digit()
+                    || (b'a'..=b'f').contains(&c)
+                    || (b'A'..=b'F').contains(&c);
+                if !is_hex {
+                    continue 'outer;
+                }
+                idx += 1;
+            }
+            if gi < groups.len() - 1 {
+                if idx >= bytes.len() || bytes[idx] != b'-' {
+                    continue 'outer;
+                }
+                idx += 1;
+            }
+        }
+        return Some(s[start..start + 36].to_ascii_lowercase());
+    }
+    None
 }
 
 mod b64 {

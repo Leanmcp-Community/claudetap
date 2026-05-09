@@ -360,6 +360,10 @@ async fn handle_request_inner(
     let (req_body_size, req_body_path, req_body_inline) =
         logger.store_request_body(&req_id, &req_body_bytes).await?;
 
+    // Best-effort: sniff Claude Code's own session UUID out of the request
+    // body and record it in the session meta. No-ops after the first hit.
+    logger.observe_request_body(&req_body_bytes).await;
+
     // Connect upstream.
     let upstream_tcp = TcpStream::connect((host.as_str(), port))
         .await
