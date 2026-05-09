@@ -197,8 +197,6 @@ async fn run_proxy_and_launch(cli: Cli) -> Result<()> {
         .row("session", session_id.clone())
         .row("proxy", proxy_url.clone())
         .row("logs", banner::abbrev_path(&session_dir))
-        .row("traffic", banner::abbrev_path(&session_dir.join("traffic.jsonl")))
-        .row("ca", banner::abbrev_path(&ca_path))
         .row("hosts", hosts.join(", "))
         .row("claude", banner::abbrev_path(&claude_path))
         .render();
