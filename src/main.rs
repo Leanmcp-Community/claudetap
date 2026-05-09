@@ -240,6 +240,7 @@ async fn run_proxy_and_launch(cli: Cli) -> Result<()> {
         arch: Some(std::env::consts::ARCH.to_string()),
         shell: std::env::var("SHELL").ok(),
         term: std::env::var("TERM").ok(),
+        system: Some(collect_system_info()),
     };
     logger.write_meta(&meta).await?;
 
@@ -334,6 +335,7 @@ async fn run_proxy_only(cli: Cli) -> Result<()> {
         arch: Some(std::env::consts::ARCH.to_string()),
         shell: std::env::var("SHELL").ok(),
         term: std::env::var("TERM").ok(),
+        system: Some(collect_system_info()),
     };
     logger.write_meta(&meta).await?;
     let banner_text = banner::Banner::new("claudetap · proxy (no child)")
@@ -390,6 +392,117 @@ async fn run_proxy_only(cli: Cli) -> Result<()> {
     proxy_task.abort();
     let _ = proxy_task.await;
     Ok(())
+}
+
+/// Gather static, non-privileged system facts: CPU counts, RAM, model name,
+/// kernel/OS version. Anything we can't read becomes `None`.
+fn collect_system_info() -> log::SystemInfo {
+    let cpu_logical = std::thread::available_parallelism()
+        .ok()
+        .map(|n| n.get() as u64);
+
+    let mut info = log::SystemInfo {
+        cpu_logical,
+        cpu_physical: None,
+        cpu_brand: None,
+        machine_model: None,
+        total_memory_bytes: None,
+        page_size_bytes: None,
+        kernel_version: None,
+        os_release: None,
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        info.total_memory_bytes = sysctl_str("hw.memsize").and_then(|s| s.parse().ok());
+        info.cpu_physical = sysctl_str("hw.physicalcpu").and_then(|s| s.parse().ok());
+        if info.cpu_logical.is_none() {
+            info.cpu_logical = sysctl_str("hw.logicalcpu").and_then(|s| s.parse().ok());
+        }
+        info.cpu_brand = sysctl_str("machdep.cpu.brand_string");
+        info.machine_model = sysctl_str("hw.model");
+        info.page_size_bytes = sysctl_str("hw.pagesize").and_then(|s| s.parse().ok());
+        info.kernel_version = sysctl_str("kern.osrelease");
+        info.os_release = sysctl_str("kern.osproductversion")
+            .or_else(|| sysctl_str("kern.osversion"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    let kb: Option<u64> = rest
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse().ok());
+                    info.total_memory_bytes = kb.map(|k| k * 1024);
+                    break;
+                }
+            }
+        }
+        if let Ok(s) = std::fs::read_to_string("/proc/cpuinfo") {
+            let mut physical_ids = std::collections::HashSet::new();
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("model name") {
+                    if info.cpu_brand.is_none() {
+                        if let Some((_, v)) = rest.split_once(':') {
+                            info.cpu_brand = Some(v.trim().to_string());
+                        }
+                    }
+                } else if let Some(rest) = line.strip_prefix("physical id") {
+                    if let Some((_, v)) = rest.split_once(':') {
+                        physical_ids.insert(v.trim().to_string());
+                    }
+                }
+            }
+            if !physical_ids.is_empty() {
+                info.cpu_physical = Some(physical_ids.len() as u64);
+            }
+        }
+        info.kernel_version = uname_r();
+        if let Ok(s) = std::fs::read_to_string("/etc/os-release") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+                    info.os_release = Some(rest.trim_matches('"').to_string());
+                    break;
+                }
+            }
+        }
+        info.page_size_bytes = page_size_bytes();
+    }
+
+    info
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_str(key: &str) -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+#[cfg(target_os = "linux")]
+fn uname_r() -> Option<String> {
+    let out = std::process::Command::new("uname").arg("-r").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+#[cfg(target_os = "linux")]
+fn page_size_bytes() -> Option<u64> {
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if n > 0 { Some(n as u64) } else { None }
 }
 
 /// Best-effort hostname lookup. Tries libc on unix, falls back to env vars.

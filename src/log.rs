@@ -86,6 +86,31 @@ pub struct SessionMeta {
     pub shell: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub term: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemInfo>,
+}
+
+/// Static host facts gathered once at session start. None of these require
+/// elevated privileges; they come from `sysctl`/`/proc`/`uname` and the
+/// standard library.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_logical: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_physical: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_brand: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_release: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
