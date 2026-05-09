@@ -230,12 +230,10 @@ async fn run_proxy_and_launch(cli: Cli) -> Result<()> {
     };
     logger.write_meta(&meta).await?;
 
-    // Forward common termination signals to the child so Ctrl-C in the
-    // terminal stops claude rather than orphaning it.
-    install_signal_forwarder(pid);
-
-    let status = child.wait().await.context("waiting on claude child")?;
-    let code = status.code();
+    // Supervise the child with an escalating signal handler so Ctrl-C
+    // ALWAYS gets us out, even when claude's TUI is hung waiting on a
+    // dead network connection and ignoring SIGINT.
+    let code = supervise_child(&mut child, pid).await;
     eprintln!(
         "\nclaudetap: claude exited (code={}) — session {}\n           logs at {}",
         code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
@@ -394,30 +392,111 @@ async fn wait_for_shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Wait for the claude child to exit, but with an escalating signal
+/// supervisor so the user can always escape:
+///
+///   1st Ctrl-C: terminal already delivered SIGINT to the foreground
+///               process group; we just print a hint and keep waiting.
+///   2nd Ctrl-C: send SIGTERM to claude.
+///   3rd Ctrl-C: SIGKILL claude and force-exit claudetap (in case the
+///               child can't be reaped, e.g. it's stuck in uninterruptible
+///               I/O against a broken FUSE/network mount).
+///
+/// Returns the child's exit code if we collected it cleanly, or 130
+/// ("killed by SIGINT") if we had to force-quit.
 #[cfg(unix)]
-fn install_signal_forwarder(pid: Option<u32>) {
+async fn supervise_child(child: &mut tokio::process::Child, pid: Option<u32>) -> Option<i32> {
     use tokio::signal::unix::{signal, SignalKind};
-    let Some(pid) = pid else { return };
-    tokio::spawn(async move {
-        let mut sigint = match signal(SignalKind::interrupt()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        loop {
-            let sig = tokio::select! {
-                _ = sigint.recv() => libc::SIGINT,
-                _ = sigterm.recv() => libc::SIGTERM,
-            };
-            unsafe {
-                libc::kill(pid as i32, sig);
+
+    let mut sigint = signal(SignalKind::interrupt()).ok();
+    let mut sigterm = signal(SignalKind::terminate()).ok();
+    let mut sigquit = signal(SignalKind::quit()).ok();
+    let mut count: u32 = 0;
+
+    loop {
+        tokio::select! {
+            wait_res = child.wait() => {
+                return match wait_res {
+                    Ok(status) => status.code(),
+                    Err(e) => {
+                        warn!(error = %e, "waiting on claude child");
+                        None
+                    }
+                };
+            }
+            Some(_) = async {
+                match sigint.as_mut() { Some(s) => s.recv().await, None => None }
+            } => { count += 1; on_signal(count, pid).await; if count >= 3 { return Some(130); } }
+            Some(_) = async {
+                match sigterm.as_mut() { Some(s) => s.recv().await, None => None }
+            } => { count += 1; on_signal(count, pid).await; if count >= 3 { return Some(143); } }
+            Some(_) = async {
+                match sigquit.as_mut() { Some(s) => s.recv().await, None => None }
+            } => {
+                // Ctrl-\: skip straight to SIGKILL+exit; this is the
+                // documented "get me out NOW" path.
+                eprintln!("\nclaudetap: SIGQUIT — killing claude and exiting.");
+                if let Some(p) = pid {
+                    unsafe { libc::kill(p as i32, libc::SIGKILL); }
+                }
+                return Some(131);
             }
         }
-    });
+    }
+}
+
+#[cfg(unix)]
+async fn on_signal(count: u32, pid: Option<u32>) {
+    match count {
+        1 => {
+            // The shell already delivered SIGINT to the whole foreground
+            // process group, so claude has it. We just inform the user
+            // about the escape hatch.
+            eprintln!(
+                "\nclaudetap: caught Ctrl-C. Press again to SIGTERM claude, a third time to force-quit."
+            );
+        }
+        2 => {
+            eprintln!("\nclaudetap: sending SIGTERM to claude. One more Ctrl-C will SIGKILL.");
+            if let Some(p) = pid {
+                unsafe { libc::kill(p as i32, libc::SIGTERM); }
+            }
+        }
+        _ => {
+            eprintln!("\nclaudetap: SIGKILLing claude and force-exiting.");
+            if let Some(p) = pid {
+                unsafe { libc::kill(p as i32, libc::SIGKILL); }
+            }
+            // Give the kernel a moment to deliver, then bail. We bypass
+            // the normal cleanup because by definition we got here only
+            // because the normal path was stuck.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
 }
 
 #[cfg(not(unix))]
-fn install_signal_forwarder(_pid: Option<u32>) {}
+async fn supervise_child(child: &mut tokio::process::Child, _pid: Option<u32>) -> Option<i32> {
+    // Windows: rely on tokio's ctrl_c handler to kill the child.
+    let mut count: u32 = 0;
+    loop {
+        tokio::select! {
+            wait_res = child.wait() => {
+                return match wait_res { Ok(s) => s.code(), Err(_) => None };
+            }
+            _ = tokio::signal::ctrl_c() => {
+                count += 1;
+                if count == 1 {
+                    eprintln!("\nclaudetap: caught Ctrl-C. Press again to kill claude.");
+                } else {
+                    eprintln!("\nclaudetap: killing claude.");
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(1), child.wait()
+                    ).await;
+                    return Some(130);
+                }
+            }
+        }
+    }
+}

@@ -179,10 +179,15 @@ async fn proxy_entry(req: Request<Incoming>, state: Arc<ProxyState>) -> Response
             };
             if logged {
                 if let Err(e) = mitm_tunnel(upgraded, host.clone(), port, state.clone()).await {
-                    warn!(error = %e, host = %host, "MITM tunnel error");
+                    // These fire for every retry when the network is down
+                    // ("downstream serve: connection error" once claude
+                    // hangs up after the upstream connect fails). Keep them
+                    // at debug so a flapping connection doesn't flood the
+                    // user's terminal; the error is still in traffic.jsonl.
+                    debug!(error = %e, host = %host, "MITM tunnel error");
                 }
             } else if let Err(e) = blind_tunnel(upgraded, host.clone(), port).await {
-                warn!(error = %e, host = %host, "blind tunnel error");
+                debug!(error = %e, host = %host, "blind tunnel error");
             }
         });
 
@@ -274,7 +279,12 @@ async fn handle_request(
     match handle_request_inner(req, state, host.clone(), port, req_id.clone(), ts_start).await {
         Ok(r) => r,
         Err(err) => {
-            warn!(error = %err, host = %host, req_id = %req_id, "request handling failed");
+            // Demoted to debug: this is the per-request twin of the MITM
+            // tunnel error above. When upstream is unreachable, claude
+            // retries aggressively and we'd otherwise emit a WARN per
+            // attempt. The failure is still surfaced as a 502 to claude
+            // and recorded in traffic.jsonl below.
+            debug!(error = %err, host = %host, req_id = %req_id, "request handling failed");
             // Best-effort error record so the failure is visible in the log.
             let record = TrafficRecord {
                 id: req_id.clone(),
