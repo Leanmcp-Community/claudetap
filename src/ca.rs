@@ -132,6 +132,154 @@ fn check_key_perms(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Install the claudetap root CA into the OS trust store so Chromium-based
+/// apps (Windsurf, Cursor, VS Code) accept our forged leaf certs. macOS uses
+/// the user login keychain (no sudo). Linux/Windows print guidance only.
+pub fn os_trust_install() -> Result<()> {
+    let cert_path = paths::ca_cert_path()?;
+    if !cert_path.exists() {
+        let _ = Ca::load_or_generate()?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").context("$HOME not set")?;
+        let keychain = format!("{home}/Library/Keychains/login.keychain-db");
+        let status = std::process::Command::new("/usr/bin/security")
+            .args([
+                "add-trusted-cert",
+                "-d",
+                "-r",
+                "trustRoot",
+                "-k",
+                &keychain,
+            ])
+            .arg(&cert_path)
+            .status()
+            .context("running /usr/bin/security add-trusted-cert")?;
+        if !status.success() {
+            return Err(anyhow!(
+                "security add-trusted-cert failed (exit {:?}). \
+                 You may be prompted for your login keychain password.",
+                status.code()
+            ));
+        }
+        eprintln!(
+            "claudetap: installed root CA into login keychain.\n\
+             Untrust later with: claudetap ca untrust"
+        );
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!(
+            "Linux trust install is not automated yet. Two stores matter for Chromium apps:\n\n\
+             1. NSS (per-user, no sudo):\n\
+                certutil -d sql:$HOME/.pki/nssdb -A -t \"C,,\" -n 'claudetap Root CA' \\\n\
+                    -i {cert}\n\n\
+             2. System (Debian/Ubuntu, requires sudo):\n\
+                sudo cp {cert} /usr/local/share/ca-certificates/claudetap.crt\n\
+                sudo update-ca-certificates\n",
+            cert = cert_path.display()
+        );
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!(
+            "Windows: certutil -user -addstore Root \"{}\"",
+            cert_path.display()
+        );
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err(anyhow!("trust install not supported on this platform"))
+    }
+}
+
+pub fn os_trust_remove() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let cert_path = paths::ca_cert_path()?;
+        // -c matches by common name; our CA's CN is "claudetap local root".
+        let status = std::process::Command::new("/usr/bin/security")
+            .args(["delete-certificate", "-c", "claudetap local root"])
+            .status()
+            .context("running /usr/bin/security delete-certificate")?;
+        if !status.success() {
+            return Err(anyhow!(
+                "security delete-certificate failed (exit {:?}). Cert at {}",
+                status.code(),
+                cert_path.display()
+            ));
+        }
+        eprintln!("claudetap: removed root CA from login keychain.");
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!(
+            "Linux: certutil -d sql:$HOME/.pki/nssdb -D -n 'claudetap Root CA'\n\
+             and/or: sudo rm /usr/local/share/ca-certificates/claudetap.crt && sudo update-ca-certificates --fresh"
+        );
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!("Windows: certutil -user -delstore Root \"claudetap local root\"");
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err(anyhow!("trust remove not supported on this platform"))
+    }
+}
+
+/// Untrust AND delete the on-disk CA files. Best-effort on each step:
+/// keychain removal failure is non-fatal (the cert may already be absent),
+/// but file deletion errors propagate. After this, the next session mints a
+/// fresh root CA.
+pub fn reset() -> Result<()> {
+    // Best-effort untrust — ignore errors (e.g. cert not in keychain).
+    let _ = os_trust_remove();
+
+    let cert = paths::ca_cert_path()?;
+    let key = paths::ca_key_path()?;
+    for p in [&cert, &key] {
+        if p.exists() {
+            std::fs::remove_file(p)
+                .with_context(|| format!("removing {}", p.display()))?;
+            eprintln!("claudetap: removed {}", p.display());
+        }
+    }
+    eprintln!(
+        "claudetap: CA reset complete. Next run will mint a fresh root CA — \
+         re-run `claudetap ca trust` afterward."
+    );
+    Ok(())
+}
+
+/// Cheap heuristic: is the claudetap root CA trusted by the OS?
+/// macOS: ask the keychain. Other platforms: return Ok(None) (unknown).
+pub fn is_os_trusted() -> Result<Option<bool>> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/usr/bin/security")
+            .args(["find-certificate", "-c", "claudetap local root"])
+            .output()
+            .context("running /usr/bin/security find-certificate")?;
+        Ok(Some(out.status.success()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
 /// In-memory cache of leaf certificates keyed by SNI host.
 #[derive(Clone)]
 pub struct LeafCertCache {

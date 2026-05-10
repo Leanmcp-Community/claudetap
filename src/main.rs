@@ -26,6 +26,40 @@ const DEFAULT_HOSTS: &[&str] = &[
     "console.anthropic.com",
 ];
 
+const WINDSURF_HOSTS: &[&str] = &[
+    // Cognition / Codeium first-party
+    "*.codeium.com",
+    "*.codeiumdata.com",
+    "*.windsurf.com",
+    "*.cognition.dev",
+    "*.cognition.ai",
+    "*.codeium.dev",
+    "*.fireworks.ai",
+    "*.ai",
+    "*.com"
+    "server.codeium.com",
+    "inference.codeium.com",
+    "exa.codeium.com",
+    "telemetry.codeium.com",
+    // Auth
+    "auth.codeium.com",
+    "login.windsurf.com",
+    // VS Code marketplace (Windsurf typically uses Open VSX)
+    "open-vsx.org",
+    "*.open-vsx.org",
+    "marketplace.visualstudio.com",
+    "*.vsassets.io",
+    "*.gallerycdn.vsassets.io",
+    // Updates / user content
+    "update.windsurf.com",
+    "*.windsurfusercontent.com",
+    // Common upstream model providers Windsurf may forward to
+    "api.openai.com",
+    "api.anthropic.com",
+    "*.anthropic.com",
+    "generativelanguage.googleapis.com",
+];
+
 #[derive(Parser, Debug)]
 #[command(
     name = "claudetap",
@@ -77,6 +111,24 @@ enum Cmd {
     /// Prints the env vars you need to wire any other client (curl, your
     /// own claude invocation, etc.) up to it.
     Proxy,
+    /// Launch Windsurf (Cognition's VS Code fork) under the proxy.
+    Windsurf {
+        /// Path to the Windsurf binary. Defaults to `which windsurf` and
+        /// platform install paths.
+        #[arg(long, value_name = "PATH")]
+        windsurf_bin: Option<PathBuf>,
+        /// Run Windsurf with an isolated user data dir (safer for testing —
+        /// keeps proxy/CA changes out of your real Windsurf profile).
+        #[arg(long, value_name = "DIR")]
+        user_data_dir: Option<PathBuf>,
+        /// Skip the OS-trust check for the claudetap root CA. Chromium will
+        /// reject our forged certs without it; only useful for debugging.
+        #[arg(long, default_value_t = false)]
+        skip_trust_check: bool,
+        /// Forwarded to Windsurf after `--`.
+        #[arg(last = true)]
+        windsurf_args: Vec<OsString>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -85,6 +137,14 @@ enum CaCmd {
     Path,
     /// Print the CA certificate to stdout.
     Print,
+    /// Install the claudetap root CA into the OS trust store (login keychain
+    /// on macOS). Required for Chromium-based clients (Windsurf, Cursor).
+    Trust,
+    /// Remove the claudetap root CA from the OS trust store.
+    Untrust,
+    /// Untrust AND delete the on-disk CA files (`~/.claudetap/ca/`). Next run
+    /// will mint a brand-new root CA — you'll need to `ca trust` it again.
+    Reset,
 }
 
 fn main() -> Result<()> {
@@ -106,6 +166,16 @@ fn main() -> Result<()> {
             let ca = ca::Ca::load_or_generate()?;
             print!("{}", ca.cert_pem);
             Ok(())
+        }
+        Some(Cmd::Ca { sub: CaCmd::Trust }) => ca::os_trust_install(),
+        Some(Cmd::Ca { sub: CaCmd::Untrust }) => ca::os_trust_remove(),
+        Some(Cmd::Ca { sub: CaCmd::Reset }) => ca::reset(),
+        Some(Cmd::Windsurf { .. }) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?;
+            rt.block_on(run_windsurf(cli))
         }
         Some(Cmd::Proxy) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -213,6 +283,7 @@ async fn run_proxy_and_launch(cli: Cli) -> Result<()> {
     // Now that we know the child PID, write session metadata.
     let meta = log::SessionMeta {
         session_id: session_id.clone(),
+        target: "claude".to_string(),
         started_at: OffsetDateTime::now_utc(),
         ended_at: None,
         claude_argv: cli
@@ -312,6 +383,7 @@ async fn run_proxy_only(cli: Cli) -> Result<()> {
     // Write session meta now (no claude child to wait on).
     let meta = log::SessionMeta {
         session_id: session_id.clone(),
+        target: "proxy".to_string(),
         started_at: OffsetDateTime::now_utc(),
         ended_at: None,
         claude_argv: Vec::new(),
@@ -390,6 +462,165 @@ async fn run_proxy_only(cli: Cli) -> Result<()> {
     proxy_task.abort();
     let _ = proxy_task.await;
     Ok(())
+}
+
+async fn run_windsurf(cli: Cli) -> Result<()> {
+    let (windsurf_bin, user_data_dir, skip_trust_check, windsurf_args) = match cli.command {
+        Some(Cmd::Windsurf {
+            ref windsurf_bin,
+            ref user_data_dir,
+            skip_trust_check,
+            ref windsurf_args,
+        }) => (
+            windsurf_bin.clone(),
+            user_data_dir.clone(),
+            skip_trust_check,
+            windsurf_args.clone(),
+        ),
+        _ => unreachable!(),
+    };
+    paths::ensure_dir(&paths::root()?)?;
+    paths::ensure_dir(&paths::sessions_dir()?)?;
+
+    let ca = Arc::new(ca::Ca::load_or_generate()?);
+
+    // Chromium uses the OS trust store. If our CA isn't there every request
+    // will fail with NET::ERR_CERT_AUTHORITY_INVALID. Warn loudly but don't
+    // bail — user may be debugging or have trust set up out-of-band.
+    if !skip_trust_check {
+        match ca::is_os_trusted()? {
+            Some(true) => {
+                eprintln!("claudetap: root CA is trusted by the OS keychain ✓");
+            }
+            Some(false) => {
+                eprintln!(
+                    "\nclaudetap: ⚠  WARNING — root CA is NOT trusted by the OS keychain.\n\
+                     \x20            Chromium will reject our forged certs; most Windsurf\n\
+                     \x20            requests will fail with NET::ERR_CERT_AUTHORITY_INVALID.\n\
+                     \x20            Fix: claudetap ca trust    (then re-run)\n\
+                     \x20            Continuing in 2s — Ctrl-C to abort.\n"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            None => {
+                eprintln!(
+                    "claudetap: ⚠  cannot verify OS trust on this platform; \
+                     ensure the root CA is trusted or Chromium will reject requests."
+                );
+            }
+        }
+    }
+
+    if user_data_dir.is_none() && launcher::is_windsurf_running() {
+        return Err(anyhow::anyhow!(
+            "Windsurf is already running. Quit it first (⌘Q on macOS), \
+             or pass --user-data-dir <fresh> to launch an isolated instance."
+        ));
+    }
+
+    let session_id = Ulid::new().to_string();
+    let logger = log::SessionLogger::create(session_id.clone(), !cli.no_redact).await?;
+
+    let hosts = if cli.hosts.is_empty() {
+        WINDSURF_HOSTS.iter().map(|s| s.to_string()).collect()
+    } else {
+        cli.hosts.clone()
+    };
+    let host_filter = proxy::HostFilter::new(hosts.clone());
+
+    let listener = proxy::bind_listener(cli.port).await?;
+    let local = listener.local_addr()?;
+    let proxy_url = format!("http://{}", local);
+
+    let state =
+        proxy::build_state(ca.clone(), logger.clone(), host_filter, cli.passthrough_only_logged)
+            .await?;
+
+    let windsurf_path = launcher::resolve_windsurf(windsurf_bin.as_deref())?;
+    let spec = launcher::LaunchSpec {
+        claude_path: windsurf_path.clone(),
+        args: windsurf_args.clone(),
+        proxy_url: proxy_url.clone(),
+        session_id: session_id.clone(),
+    };
+
+    let proxy_state = state.clone();
+    let proxy_task = tokio::spawn(async move {
+        if let Err(e) = proxy::run(listener, proxy_state).await {
+            warn!(error = %e, "proxy loop exited");
+        }
+    });
+
+    let session_dir = paths::session_dir(&session_id)?;
+    let ca_path = paths::ca_cert_path()?;
+    let banner_text = banner::Banner::new("claudetap · windsurf")
+        .row("session", session_id.clone())
+        .row("proxy", proxy_url.clone())
+        .row("logs", banner::abbrev_path(&session_dir))
+        .row("hosts", hosts.join(", "))
+        .row("windsurf", banner::abbrev_path(&windsurf_path))
+        .render();
+    print!("{}", banner_text);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    write_last_session_pointer(&session_id, &session_dir, &proxy_url)?;
+
+    let mut child = launcher::spawn_windsurf(spec, user_data_dir.as_deref()).await?;
+    let pid = child.id();
+
+    let meta = log::SessionMeta {
+        session_id: session_id.clone(),
+        target: "windsurf".to_string(),
+        started_at: OffsetDateTime::now_utc(),
+        ended_at: None,
+        claude_argv: windsurf_args
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect(),
+        claude_path: windsurf_path.display().to_string(),
+        claude_pid: pid,
+        claude_exit_code: None,
+        claude_session_id: None,
+        claude_version: None,
+        proxy_addr: local.to_string(),
+        redact: !cli.no_redact,
+        host_filter: hosts,
+        claudetap_version: env!("CARGO_PKG_VERSION").to_string(),
+        session_dir: Some(session_dir.display().to_string()),
+        ca_cert_path: Some(ca_path.display().to_string()),
+        cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        user: std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok()),
+        hostname: hostname(),
+        os: Some(std::env::consts::OS.to_string()),
+        arch: Some(std::env::consts::ARCH.to_string()),
+        shell: std::env::var("SHELL").ok(),
+        term: std::env::var("TERM").ok(),
+        system: Some(collect_system_info()),
+    };
+    logger.write_meta(&meta).await?;
+
+    let code = supervise_child(&mut child, pid).await;
+    if let Err(e) = logger
+        .update_meta(|m| {
+            m.ended_at = Some(OffsetDateTime::now_utc());
+            m.claude_exit_code = code;
+        })
+        .await
+    {
+        warn!(error = %e, "updating meta.json on shutdown");
+    }
+    eprintln!(
+        "\nclaudetap: windsurf exited (code={}) — session {}\n           logs at {}",
+        code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
+        session_id,
+        session_dir.display()
+    );
+
+    proxy_task.abort();
+    let _ = proxy_task.await;
+
+    std::process::exit(code.unwrap_or(0));
 }
 
 /// Gather static, non-privileged system facts: CPU counts, RAM, model name,

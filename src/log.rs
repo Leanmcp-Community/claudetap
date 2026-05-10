@@ -44,6 +44,9 @@ const INLINE_BODY_LIMIT: usize = 64 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub session_id: String,
+    /// Which child app this session is taping: "claude", "windsurf", or "proxy".
+    #[serde(default = "default_target")]
+    pub target: String,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     #[serde(
@@ -88,6 +91,10 @@ pub struct SessionMeta {
     pub term: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemInfo>,
+}
+
+fn default_target() -> String {
+    "claude".to_string()
 }
 
 /// Static host facts gathered once at session start. None of these require
