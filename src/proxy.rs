@@ -74,6 +74,9 @@ impl HostFilter {
         let host = host.to_ascii_lowercase();
         for p in &self.patterns {
             let p = p.to_ascii_lowercase();
+            if p == "*" {
+                return true;
+            }
             if let Some(suffix) = p.strip_prefix("*.") {
                 if host == suffix || host.ends_with(&format!(".{suffix}")) {
                     return true;

@@ -35,8 +35,6 @@ const WINDSURF_HOSTS: &[&str] = &[
     "*.cognition.ai",
     "*.codeium.dev",
     "*.fireworks.ai",
-    "*.ai",
-    "*.com"
     "server.codeium.com",
     "inference.codeium.com",
     "exa.codeium.com",
