@@ -566,6 +566,7 @@ async fn run_windsurf(cli: Cli) -> Result<()> {
 
     let mut child = launcher::spawn_windsurf(spec, user_data_dir.as_deref()).await?;
     let pid = child.id();
+    let spawn_instant = std::time::Instant::now();
 
     let meta = log::SessionMeta {
         session_id: session_id.clone(),
@@ -608,12 +609,32 @@ async fn run_windsurf(cli: Cli) -> Result<()> {
     {
         warn!(error = %e, "updating meta.json on shutdown");
     }
+    let elapsed = spawn_instant.elapsed();
     eprintln!(
-        "\nclaudetap: windsurf exited (code={}) — session {}\n           logs at {}",
+        "\nclaudetap: windsurf exited (code={}, after {:.1}s) — session {}\n           logs at {}",
         code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
+        elapsed.as_secs_f32(),
         session_id,
         session_dir.display()
     );
+
+    // Heuristic: Electron's single-instance lock makes the new process exit
+    // ~immediately with code 0 after IPC-handing-off args to an existing
+    // Windsurf. If we see that pattern, point the user at the real fix.
+    if elapsed < std::time::Duration::from_secs(3) && code == Some(0) {
+        eprintln!(
+            "\nclaudetap: ⚠  windsurf exited almost immediately. Most likely cause:\n\
+             \x20            another Windsurf process is alive and the new launch was\n\
+             \x20            forwarded to it via Electron's single-instance lock — meaning\n\
+             \x20            our proxy and CA settings were dropped.\n\n\
+             \x20  Try one of:\n\
+             \x20    1. Fully kill all Windsurf procs:\n\
+             \x20         pkill -9 -i windsurf && sleep 1 && pgrep -fl -i windsurf\n\
+             \x20       then re-run claudetap windsurf.\n\
+             \x20    2. Use an isolated profile (bypasses the singleton lock):\n\
+             \x20         claudetap windsurf --user-data-dir /tmp/wsf-tap\n"
+        );
+    }
 
     proxy_task.abort();
     let _ = proxy_task.await;
