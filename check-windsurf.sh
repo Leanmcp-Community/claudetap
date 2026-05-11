@@ -5,6 +5,7 @@ set -u
 pass() { printf "  \033[32m✓\033[0m %s\n" "$1"; }
 fail() { printf "  \033[31m✗\033[0m %s\n" "$1"; FAILED=1; }
 info() { printf "  · %s\n" "$1"; }
+
 FAILED=0
 
 echo "1. claudetap binary"
