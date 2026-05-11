@@ -28,6 +28,25 @@ pub fn resolve_windsurf(explicit: Option<&Path>) -> Result<PathBuf> {
         return Err(anyhow!("--windsurf-bin {} does not exist", p.display()));
     }
 
+    // On macOS, prefer the real Electron binary inside Windsurf.app over
+    // whatever `which windsurf` finds — the latter is typically the
+    // ~/.codeium/windsurf/bin/windsurf CLI shim, which uses `open` to launch
+    // the GUI as a detached process. That detaches the child from claudetap,
+    // so the supervisor sees an immediate exit(0) and tears down the proxy
+    // before any real traffic flows.
+    #[cfg(target_os = "macos")]
+    {
+        for c in [
+            "/Applications/Windsurf.app/Contents/MacOS/Electron",
+            "/Applications/Windsurf.app/Contents/MacOS/Windsurf",
+        ] {
+            let p = PathBuf::from(c);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+    }
+
     if let Some(p) = which("windsurf") {
         return Ok(p);
     }

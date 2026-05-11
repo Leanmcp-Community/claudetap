@@ -330,7 +330,8 @@ fn mint_leaf(ca: &Ca, host: &str) -> Result<rustls::sign::CertifiedKey> {
     ];
     let now = OffsetDateTime::now_utc();
     params.not_before = now - Duration::days(1);
-    params.not_after = now + Duration::days(825);
+    // Apple/Chromium reject TLS server leaf certs valid for >398 days.
+    params.not_after = now + Duration::days(397);
 
     let leaf_key = KeyPair::generate().context("generating leaf key pair")?;
     let leaf_cert = params
