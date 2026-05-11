@@ -145,10 +145,13 @@ pub fn os_trust_install() -> Result<()> {
     {
         let home = std::env::var("HOME").context("$HOME not set")?;
         let keychain = format!("{home}/Library/Keychains/login.keychain-db");
+        // NOTE: omit `-d` (admin domain) — that requires sudo and silently
+        // installs the cert without an associated trust policy when run as
+        // a normal user. User-domain trust works without sudo and is what
+        // Chromium honors for user-added roots.
         let status = std::process::Command::new("/usr/bin/security")
             .args([
                 "add-trusted-cert",
-                "-d",
                 "-r",
                 "trustRoot",
                 "-k",
