@@ -1,0 +1,149 @@
+/* claudetap TUI — theme */
+
+Screen {
+    background: $surface;
+}
+
+/* ── Session List Screen ───────────────────────────────────────── */
+
+#session-header {
+    dock: top;
+    height: 3;
+    padding: 1 2;
+    background: $primary-background;
+    color: $text;
+}
+
+#session-header .title {
+    text-style: bold;
+    color: $secondary;
+}
+
+#session-table {
+    height: 1fr;
+}
+
+#session-table > .datatable--header {
+    text-style: bold;
+    color: $accent;
+}
+
+#session-table > .datatable--cursor {
+    background: $accent 30%;
+    color: $text;
+    text-style: bold;
+}
+
+/* ── Request List Screen ───────────────────────────────────────── */
+
+#request-header {
+    dock: top;
+    height: 3;
+    padding: 1 2;
+    background: $primary-background;
+    color: $text;
+}
+
+#request-table {
+    height: 1fr;
+}
+
+#request-table > .datatable--cursor {
+    background: $accent 30%;
+    color: $text;
+    text-style: bold;
+}
+
+#filter-bar {
+    dock: bottom;
+    height: 3;
+    padding: 0 2;
+    background: $panel;
+    display: none;
+}
+
+#filter-bar.visible {
+    display: block;
+}
+
+#filter-input {
+    width: 1fr;
+}
+
+/* ── Detail Screen ─────────────────────────────────────────────── */
+
+#detail-scroll {
+    height: 1fr;
+    padding: 1 2;
+}
+
+#detail-header {
+    height: auto;
+    padding: 0 0 1 0;
+}
+
+#detail-url {
+    text-style: bold;
+    color: $text;
+}
+
+#detail-meta {
+    color: $text-muted;
+}
+
+.section-title {
+    text-style: bold;
+    padding: 1 0 0 0;
+    color: $accent;
+}
+
+.section-box {
+    border: solid $primary-background;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    height: auto;
+}
+
+.header-line {
+    color: $text;
+}
+
+.header-name {
+    color: $secondary;
+    text-style: bold;
+}
+
+.body-label {
+    color: $text-muted;
+    padding: 1 0 0 0;
+}
+
+.body-content {
+    padding: 0;
+    height: auto;
+}
+
+/* ── Status colors ─────────────────────────────────────────────── */
+
+.status-2xx { color: $success; }
+.status-3xx { color: $accent; }
+.status-4xx { color: $warning; }
+.status-5xx { color: $error; }
+
+.method-get     { color: $success; }
+.method-post    { color: $warning; }
+.method-put     { color: $accent; }
+.method-delete  { color: $error; }
+.method-options { color: $text-muted; }
+.method-head    { color: $text-muted; }
+
+/* ── Footer ────────────────────────────────────────────────────── */
+
+Footer {
+    background: $primary-background;
+}
+
+Header {
+    background: $primary-background;
+    color: $secondary;
+}
