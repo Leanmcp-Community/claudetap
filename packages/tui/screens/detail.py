@@ -50,6 +50,8 @@ class DetailScreen(Screen):
         ("q", "quit", "Quit"),
         ("n", "next_entry", "Next"),
         ("p", "prev_entry", "Prev"),
+        Binding("right", "next_entry", "Next →", show=False),
+        Binding("left", "prev_entry", "← Prev", show=False),
     ]
 
     def __init__(
@@ -111,15 +113,20 @@ class DetailScreen(Screen):
         # Body
         req_size = e.req_body_size
         if req_size > 0:
-            body_txt, label = decode_body(
+            body_txt, label, decoded = decode_body(
                 e.request.get("body_inline"),
                 e.request.get("body_path"),
                 e.req_content_type,
             )
             label_display = label.upper()
+            decoded_badge = (
+                "[green bold]✓ DECODED[/green bold]"
+                if decoded
+                else "[red bold]✗ RAW[/red bold]"
+            )
             lines.append("")
             lines.append(
-                f"  [dim]body ({req_size:,} bytes, {label_display}):[/dim]"
+                f"  [dim]body ({req_size:,} bytes, {label_display})[/dim]  {decoded_badge}"
             )
             lines.append("")
             if body_txt:
@@ -172,15 +179,20 @@ class DetailScreen(Screen):
                         f"    [dim]… {len(sse_lines) - 80} more lines[/dim]"
                     )
         elif resp_size > 0:
-            body_txt, label = decode_body(
+            body_txt, label, decoded = decode_body(
                 e.response.get("body_inline"),
                 e.response.get("body_path"),
                 e.resp_content_type,
             )
             label_display = label.upper()
+            decoded_badge = (
+                "[green bold]✓ DECODED[/green bold]"
+                if decoded
+                else "[red bold]✗ RAW[/red bold]"
+            )
             lines.append("")
             lines.append(
-                f"  [dim]body ({resp_size:,} bytes, {label_display}):[/dim]"
+                f"  [dim]body ({resp_size:,} bytes, {label_display})[/dim]  {decoded_badge}"
             )
             lines.append("")
             if body_txt:

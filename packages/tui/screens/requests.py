@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 
+from rich.text import Text
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -94,11 +95,25 @@ class RequestListScreen(Screen):
         table.add_columns("#", "TIME", "METHOD", "STATUS", "URL")
 
         for i, e in enumerate(self._filtered_entries, 1):
+            status_str = str(e.status or "?")
+            status_text = Text(status_str)
+            if e.status is not None:
+                if e.status >= 500:
+                    status_text.stylize("bold red")
+                elif e.status >= 400:
+                    status_text.stylize("bold yellow")
+                elif e.status >= 300:
+                    status_text.stylize("cyan")
+                else:
+                    status_text.stylize("green")
+            else:
+                status_text.stylize("dim")
+
             table.add_row(
                 str(i),
                 e.time_short,
                 e.method,
-                str(e.status or "?"),
+                status_text,
                 e.url_short,
                 key=str(i - 1),  # index into _filtered_entries
             )
