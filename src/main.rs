@@ -123,13 +123,14 @@ enum Cmd {
         /// reject our forged certs without it; only useful for debugging.
         #[arg(long, default_value_t = false)]
         skip_trust_check: bool,
-        /// If Windsurf is already running, terminate it first (SIGTERM, then
-        /// SIGKILL after a short grace period) and relaunch under the proxy.
-        /// Without this, claudetap aborts when Windsurf is already running,
-        /// because Electron's single-instance lock would silently forward the
-        /// new launch to the existing process and drop our proxy / CA env.
-        #[arg(long, short = 'r', default_value_t = false)]
-        restart: bool,
+        /// Do NOT kill an already-running Windsurf. Default behavior is to
+        /// terminate any running Windsurf (SIGTERM, then SIGKILL after a
+        /// short grace period) and relaunch it under the proxy, because
+        /// Electron's single-instance lock would otherwise silently forward
+        /// the new launch to the existing process and drop our proxy / CA
+        /// env. Pass this flag to abort with an error instead.
+        #[arg(long, default_value_t = false)]
+        no_restart: bool,
         /// Forwarded to Windsurf after `--`.
         #[arg(last = true)]
         windsurf_args: Vec<OsString>,
@@ -470,19 +471,19 @@ async fn run_proxy_only(cli: Cli) -> Result<()> {
 }
 
 async fn run_windsurf(cli: Cli) -> Result<()> {
-    let (windsurf_bin, user_data_dir, skip_trust_check, restart, windsurf_args) =
+    let (windsurf_bin, user_data_dir, skip_trust_check, no_restart, windsurf_args) =
         match cli.command {
             Some(Cmd::Windsurf {
                 ref windsurf_bin,
                 ref user_data_dir,
                 skip_trust_check,
-                restart,
+                no_restart,
                 ref windsurf_args,
             }) => (
                 windsurf_bin.clone(),
                 user_data_dir.clone(),
                 skip_trust_check,
-                restart,
+                no_restart,
                 windsurf_args.clone(),
             ),
             _ => unreachable!(),
@@ -520,34 +521,44 @@ async fn run_windsurf(cli: Cli) -> Result<()> {
     }
 
     if user_data_dir.is_none() && launcher::is_windsurf_running() {
-        if restart {
-            eprintln!(
-                "claudetap: Windsurf is already running — terminating it (--restart)..."
-            );
-            let killed = launcher::kill_running_windsurf(
-                std::time::Duration::from_secs(4),
-            )
-            .await;
-            // Brief settle delay so the singleton lock file is released.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if launcher::is_windsurf_running() {
-                return Err(anyhow::anyhow!(
-                    "claudetap: --restart killed {} Windsurf process(es) but \
-                     some are still alive. Try again, or quit them manually.",
-                    killed
-                ));
-            }
-            eprintln!(
-                "claudetap: terminated {} Windsurf process(es); relaunching under the proxy.",
-                killed
-            );
-        } else {
+        if no_restart {
             return Err(anyhow::anyhow!(
-                "Windsurf is already running. Quit it first (⌘Q on macOS), \
-                 re-run with --restart to kill and relaunch under the proxy, \
-                 or pass --user-data-dir <fresh> to launch an isolated instance."
+                "Windsurf is already running and --no-restart was passed. \
+                 Quit it first (⌘Q on macOS), drop --no-restart to let \
+                 claudetap kill and relaunch it, or pass --user-data-dir \
+                 <fresh> to launch an isolated instance."
             ));
         }
+        let before = launcher::running_windsurf_pids();
+        eprintln!(
+            "claudetap: Windsurf is already running ({} proc(s)) — terminating it so we can \
+             relaunch under the proxy (pass --no-restart to disable)...",
+            before.len()
+        );
+        let killed =
+            launcher::kill_running_windsurf(std::time::Duration::from_secs(2)).await;
+        // Brief settle delay so the singleton lock file is released.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let survivors = launcher::running_windsurf_pids();
+        if !survivors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "claudetap: signalled {} Windsurf process(es) but {} are still alive: {:?}.\n\
+                 This usually means something (launchctl KeepAlive, a watchdog, or your \
+                 desktop session) is respawning Windsurf faster than we can kill it.\n\
+                 Try:\n\
+                  - quit Windsurf manually (⌘Q), then re-run claudetap windsurf;\n\
+                  - check `launchctl list | grep -i windsurf` for KeepAlive agents;\n\
+                  - run with --user-data-dir /tmp/wsf-tap to launch an isolated instance \
+                    instead of restarting yours.",
+                killed,
+                survivors.len(),
+                survivors,
+            ));
+        }
+        eprintln!(
+            "claudetap: terminated {} Windsurf process(es); relaunching under the proxy.",
+            killed
+        );
     }
 
     let session_id = Ulid::new().to_string();
@@ -661,13 +672,11 @@ async fn run_windsurf(cli: Cli) -> Result<()> {
              \x20            another Windsurf process is alive and the new launch was\n\
              \x20            forwarded to it via Electron's single-instance lock — meaning\n\
              \x20            our proxy and CA settings were dropped.\n\n\
-             \x20  Try one of:\n\
-             \x20    1. Re-run with --restart (kills running Windsurf, then relaunches):\n\
-             \x20         claudetap windsurf --restart\n\
-             \x20    2. Fully kill all Windsurf procs yourself:\n\
+             \x20  This usually means our process-detection missed it. Try:\n\
+             \x20    1. Fully kill all Windsurf procs yourself, then re-run:\n\
              \x20         pkill -9 -i windsurf && sleep 1 && pgrep -fl -i windsurf\n\
-             \x20       then re-run claudetap windsurf.\n\
-             \x20    3. Use an isolated profile (bypasses the singleton lock):\n\
+             \x20         claudetap windsurf\n\
+             \x20    2. Use an isolated profile (bypasses the singleton lock):\n\
              \x20         claudetap windsurf --user-data-dir /tmp/wsf-tap\n"
         );
     }

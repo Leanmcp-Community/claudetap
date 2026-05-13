@@ -133,13 +133,21 @@ pub fn running_windsurf_pids() -> Vec<u32> {
     pids
 }
 
-/// Terminate any running Windsurf processes. Sends SIGTERM first, waits up to
-/// `grace`, then SIGKILLs anything still alive. Returns the number of PIDs we
-/// signalled. Best-effort — Windsurf may also be relaunched by `launchd` or a
-/// user; we only do one pass.
+/// Terminate every running Windsurf process. Strategy:
+///
+/// 1. SIGTERM all detected PIDs and wait briefly for graceful exit.
+/// 2. For everything still alive, SIGSTOP them first (freezes them so they
+///    can't fork new children — Electron's main process otherwise respawns
+///    helpers during shutdown faster than we can kill them), then SIGKILL.
+/// 3. Loop the STOP+KILL pass until either everything is gone or we hit a
+///    safety cap (in case some watchdog keeps respawning the app).
+///
+/// `_grace` is the upper bound on phase 1 (graceful TERM). Total runtime is
+/// capped at roughly `grace + 3s`. Returns the *unique* number of PIDs we
+/// signalled across all passes.
 pub async fn kill_running_windsurf(grace: std::time::Duration) -> usize {
-    let pids = running_windsurf_pids();
-    if pids.is_empty() {
+    let initial = running_windsurf_pids();
+    if initial.is_empty() {
         return 0;
     }
 
@@ -147,51 +155,72 @@ pub async fn kill_running_windsurf(grace: std::time::Duration) -> usize {
     {
         // If claudetap was launched from Windsurf's own integrated terminal,
         // killing Windsurf will close our controlling tty and deliver SIGHUP
-        // to us. Ignore it so we survive long enough to relaunch Windsurf.
-        // SIGPIPE for the same reason — writes to the dead stdout would
-        // otherwise terminate us.
+        // to us. Ignore so we survive long enough to relaunch. SIGPIPE for
+        // the same reason — writes to the dead stdout would otherwise kill us.
         unsafe {
             libc::signal(libc::SIGHUP, libc::SIG_IGN);
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
-        for &pid in &pids {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-        }
     }
 
-    // Poll for exit; bail out early once everything is gone.
-    let start = std::time::Instant::now();
+    let mut seen: std::collections::HashSet<u32> = initial.iter().copied().collect();
+
+    // Phase 1: SIGTERM and short graceful wait.
+    #[cfg(unix)]
+    for &pid in &initial {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
     let poll = std::time::Duration::from_millis(150);
-    while start.elapsed() < grace {
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
         if running_windsurf_pids().is_empty() {
-            return pids.len();
+            return seen.len();
         }
         tokio::time::sleep(poll).await;
     }
 
-    // Anything still alive gets SIGKILLed.
-    #[cfg(unix)]
-    {
-        for pid in running_windsurf_pids() {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
-    }
-
-    // Give the OS a moment to reap.
-    let kill_deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(1500);
-    while std::time::Instant::now() < kill_deadline {
-        if running_windsurf_pids().is_empty() {
+    // Phase 2: SIGSTOP+SIGKILL passes. Loop because Electron's main process
+    // re-forks helpers during shutdown; the only reliable way to drain is to
+    // freeze each batch before killing it, then look for any NEW children
+    // that appeared.
+    let max_passes = 8;
+    for _ in 0..max_passes {
+        let pids = running_windsurf_pids();
+        if pids.is_empty() {
             break;
         }
-        tokio::time::sleep(poll).await;
+        for p in &pids {
+            seen.insert(*p);
+        }
+        #[cfg(unix)]
+        {
+            // Freeze first — a stopped process can't fork or hand off to a
+            // helper. Then kill while frozen.
+            for &pid in &pids {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGSTOP);
+                }
+            }
+            for &pid in &pids {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            // SIGCONT so the kernel can deliver the SIGKILL to a stopped
+            // process and reap it. (On Linux SIGKILL on a stopped task does
+            // get delivered, but CONT removes the race on macOS.)
+            for &pid in &pids {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGCONT);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 
-    pids.len()
+    seen.len()
 }
 
 pub async fn spawn_windsurf(spec: LaunchSpec, user_data_dir: Option<&Path>) -> Result<Child> {
