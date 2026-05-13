@@ -137,7 +137,12 @@ class RequestListScreen(Screen):
             entry = self._filtered_entries[idx]
             from .detail import DetailScreen
             self.app.push_screen(
-                DetailScreen(entry, self._filtered_entries, idx)
+                DetailScreen(
+                    entry,
+                    self._filtered_entries,
+                    idx,
+                    session_dir=self.session.session_dir,
+                )
             )
 
     def action_go_back(self) -> None:

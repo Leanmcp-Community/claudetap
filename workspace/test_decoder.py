@@ -68,6 +68,70 @@ def main() -> int:
         "gzip",
     )
 
+    # Git smart-HTTP — real bytes from GitHub's info/refs?service=git-upload-pack
+    git_advert = (
+        b"001e# service=git-upload-pack\n"
+        b"0000"
+        b"000eversion 2\n"
+        b"0028agent=git/github-f8bdfd365d97-Linux\n"
+        b"0013ls-refs=unborn\n"
+        b"0027fetch=shallow wait-for-done filter\n"
+        b"0012server-option\n"
+        b"0017object-format=sha1\n"
+        b"0000"
+    )
+    case(
+        "git smart-HTTP info/refs advertisement",
+        git_advert,
+        "application/x-git-upload-pack-advertisement",
+        "",
+    )
+
+    # Junk that looks like 4 hex chars but isn't valid pkt-line framing
+    case(
+        "git content-type but junk bytes (should fall through to hex)",
+        b"\x00\x01\x02\x03\xff\xfe",
+        "application/x-git-upload-pack-result",
+        "",
+    )
+
+    # body_path resolved against session_dir
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = os.path.join(tmp, "bodies")
+        os.makedirs(tmp_path)
+        body_file = os.path.join(tmp_path, "01ABC.req.bin")
+        big_payload = b'{"events":[' + b'{"k":"v"},' * 1000 + b'{"k":"v"}]}'
+        with open(body_file, "wb") as f:
+            f.write(big_payload)
+
+        # Relative path + session_dir provided → should resolve & decode
+        from pathlib import Path
+        txt, label, dec = decoder.decode_body(
+            None,
+            "bodies/01ABC.req.bin",
+            "application/json",
+            "",
+            session_dir=Path(tmp),
+        )
+        print("--- body_path relative + session_dir provided ---")
+        print(f"  label={label!r}  decoded={dec}")
+        print(f"  text={txt[:80]!r}…")
+        print()
+
+        # Relative path + NO session_dir → should be MISSING (regression: this is
+        # the bug the telemetry payload hit)
+        txt, label, dec = decoder.decode_body(
+            None,
+            "bodies/01ABC.req.bin",
+            "application/json",
+            "",
+        )
+        print("--- body_path relative + no session_dir (the bug we just fixed) ---")
+        print(f"  label={label!r}  decoded={dec}")
+        print(f"  text={txt!r}")
+        print()
+
     return 0
 
 

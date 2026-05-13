@@ -59,11 +59,13 @@ class DetailScreen(Screen):
         entry: TrafficEntry,
         entries: list[TrafficEntry],
         index: int,
+        session_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self.entry = entry
         self.entries = entries
         self.index = index
+        self.session_dir = session_dir
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -118,6 +120,7 @@ class DetailScreen(Screen):
                 e.request.get("body_path"),
                 e.req_content_type,
                 e.req_content_encoding,
+                session_dir=self.session_dir,
             )
             label_display = label.upper()
             decoded_badge = (
@@ -170,6 +173,8 @@ class DetailScreen(Screen):
             lines.append("")
             lines.append(f"  [dim]streaming SSE → {_escape(stream_path)}[/dim]")
             p = Path(stream_path)
+            if not p.is_absolute() and self.session_dir is not None:
+                p = self.session_dir / p
             if p.exists():
                 sse_lines = p.read_text(errors="replace").splitlines()
                 show = sse_lines[:80]
@@ -185,6 +190,7 @@ class DetailScreen(Screen):
                 e.response.get("body_path"),
                 e.resp_content_type,
                 e.resp_content_encoding,
+                session_dir=self.session_dir,
             )
             label_display = label.upper()
             decoded_badge = (

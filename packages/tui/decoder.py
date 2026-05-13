@@ -80,6 +80,54 @@ def _decompress_content_encoding(
     return raw, None
 
 
+def _format_git_pkt_lines(raw: bytes) -> str | None:
+    """
+    Parse git smart-HTTP pkt-line framing (protocol v2).
+
+    Each pkt is `LLLL` (4 ASCII hex chars = total length incl. header) +
+    payload. `0000` = flush, `0001` = delim, `0002` = response-end. Returns
+    a pretty-printed string, or None if the body isn't valid pkt-line
+    framing (e.g. raw packfile bytes after the side-band header).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    if n < 4:
+        return None
+    while i + 4 <= n:
+        try:
+            length = int(raw[i : i + 4].decode("ascii"), 16)
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if length == 0:
+            out.append("0000  [flush-pkt]")
+            i += 4
+            continue
+        if length == 1:
+            out.append("0001  [delim-pkt]")
+            i += 4
+            continue
+        if length == 2:
+            out.append("0002  [response-end-pkt]")
+            i += 4
+            continue
+        if length < 4 or i + length > n:
+            return None
+        payload = raw[i + 4 : i + length]
+        try:
+            text = payload.decode("utf-8")
+            out.append(f"{length:04x}  {text.rstrip(chr(10))}")
+        except UnicodeDecodeError:
+            # Side-band binary chunk (typically packfile data on chan 1).
+            preview = " ".join(f"{b:02x}" for b in payload[:32])
+            suffix = f" … ({len(payload)} bytes)" if len(payload) > 32 else ""
+            out.append(f"{length:04x}  [binary] {preview}{suffix}")
+        i += length
+    if i != n:
+        return None
+    return "\n".join(out)
+
+
 def _try_protobuf_decode(raw: bytes) -> str | None:
     """
     Attempt schema-less protobuf decoding via `protoc --decode_raw`.
@@ -107,6 +155,7 @@ def decode_body(
     body_path: str | None,
     content_type: str,
     content_encoding: str = "",
+    session_dir: Path | None = None,
 ) -> tuple[str, str, bool]:
     """
     Decode a request/response body.
@@ -115,16 +164,21 @@ def decode_body(
       - label is one of: "json", "text", "proto", "binary", "empty", "error", "missing"
       - decoded is True if the body was successfully decoded into human-readable form,
         False if it's still raw/hex/binary
+
+    `body_path` is interpreted relative to `session_dir` if provided
+    (matches how the Rust proxy writes them in `traffic.jsonl`).
     """
     if body_inline is None and not body_path:
         return "", "empty", False
 
     if body_path:
         p = Path(body_path)
+        if not p.is_absolute() and session_dir is not None:
+            p = session_dir / p
         if p.exists():
             raw = p.read_bytes()
         else:
-            return f"(body file not found: {body_path})", "missing", False
+            return f"(body file not found: {p})", "missing", False
     else:
         enc = body_inline.get("encoding", "")
         data_str = body_inline.get("data", "")
@@ -179,6 +233,14 @@ def decode_body(
         return json.dumps(obj, indent=2, ensure_ascii=False), "json", True
     except Exception:
         pass
+
+    # Git smart-HTTP — pkt-line framed text/binary
+    # (e.g. application/x-git-upload-pack-advertisement, ...-result, etc.)
+    if "x-git-" in ct or "git-upload-pack" in ct or "git-receive-pack" in ct:
+        pkt = _format_git_pkt_lines(raw)
+        if pkt is not None:
+            return pkt, "git", True
+        # Framing didn't validate (pure packfile bytes?) — fall through.
 
     # Protobuf — try schema-less decode via protoc
     if "proto" in ct or "connect+proto" in ct or "grpc" in ct:
