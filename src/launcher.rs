@@ -240,6 +240,21 @@ pub async fn spawn_windsurf(spec: LaunchSpec, user_data_dir: Option<&Path>) -> R
     }
     cmd.args(&spec.args);
 
+    // If the user didn't pass a positional path after `--`, default to opening
+    // the directory `claudetap windsurf` was invoked from. Without this, the
+    // bare Electron binary reopens whatever workspace it had last — which is
+    // emphatically NOT what someone running `claudetap windsurf` from a
+    // project dir expects (`windsurf .` is the equivalent shim behavior).
+    let user_supplied_path = spec.args.iter().any(|a| {
+        let s = a.to_string_lossy();
+        !s.is_empty() && !s.starts_with('-')
+    });
+    if !user_supplied_path {
+        if let Ok(cwd) = std::env::current_dir() {
+            cmd.arg(cwd);
+        }
+    }
+
     cmd.env("HTTPS_PROXY", &spec.proxy_url);
     cmd.env("https_proxy", &spec.proxy_url);
     cmd.env("HTTP_PROXY", &spec.proxy_url);
