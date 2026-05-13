@@ -1,0 +1,19 @@
+# claudetap TUI — Python dependencies
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# The TUI itself is launched via:
+#     python -m packages.tui [session-id]
+
+# Terminal UI framework
+textual>=0.50
+
+# HTTP body decompression for `content-encoding: br` (Codeium / Cloudflare /
+# many modern APIs). `brotli` is the C-extension build; `brotlicffi` is the
+# pure-CFFI fallback and is picked up automatically if `brotli` is missing.
+brotli>=1.1.0
+
+# HTTP body decompression for `content-encoding: zstd` (rarer, but Anthropic
+# and others have started emitting it).
+zstandard>=0.22

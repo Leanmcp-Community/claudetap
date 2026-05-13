@@ -1,4 +1,4 @@
-"""Decode base64/gzip HTTP bodies into human-readable text."""
+"""Decode base64/gzip/brotli/deflate/zstd HTTP bodies into human-readable text."""
 
 from __future__ import annotations
 
@@ -7,8 +7,77 @@ import gzip
 import json
 import shutil
 import subprocess
+import zlib
 from datetime import datetime
 from pathlib import Path
+
+
+def _decompress_content_encoding(
+    raw: bytes, content_encoding: str
+) -> tuple[bytes, str | None]:
+    """
+    Apply the transfer codings listed in a `Content-Encoding` header.
+
+    Returns (decompressed_bytes, error_or_none). Multi-value headers
+    (e.g. "gzip, br") are unwrapped in reverse listed order, per RFC 9110.
+    Unknown / "identity" codings are silently passed through. Missing
+    optional libraries (brotli, zstandard) produce a clear error string
+    so the user sees *why* the body still looks binary.
+    """
+    if not raw or not content_encoding:
+        return raw, None
+
+    codings = [c.strip().lower() for c in content_encoding.split(",") if c.strip()]
+    for coding in reversed(codings):
+        if coding in ("identity", ""):
+            continue
+        if coding == "gzip" or coding == "x-gzip":
+            try:
+                raw = gzip.decompress(raw)
+            except Exception as e:
+                return raw, f"gzip decode error: {e}"
+        elif coding == "deflate":
+            # Some servers send raw deflate, some send zlib-wrapped. Try both.
+            try:
+                raw = zlib.decompress(raw)
+            except zlib.error:
+                try:
+                    raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                except Exception as e:
+                    return raw, f"deflate decode error: {e}"
+            except Exception as e:
+                return raw, f"deflate decode error: {e}"
+        elif coding == "br":
+            try:
+                import brotli  # type: ignore
+            except ImportError:
+                try:
+                    import brotlicffi as brotli  # type: ignore
+                except ImportError:
+                    return (
+                        raw,
+                        "brotli (`content-encoding: br`) — install `brotli` "
+                        "or `brotlicffi` to decode",
+                    )
+            try:
+                raw = brotli.decompress(raw)
+            except Exception as e:
+                return raw, f"brotli decode error: {e}"
+        elif coding == "zstd":
+            try:
+                import zstandard  # type: ignore
+            except ImportError:
+                return (
+                    raw,
+                    "zstd (`content-encoding: zstd`) — install `zstandard` to decode",
+                )
+            try:
+                raw = zstandard.ZstdDecompressor().decompress(raw)
+            except Exception as e:
+                return raw, f"zstd decode error: {e}"
+        else:
+            return raw, f"unknown content-encoding: {coding!r}"
+    return raw, None
 
 
 def _try_protobuf_decode(raw: bytes) -> str | None:
@@ -37,6 +106,7 @@ def decode_body(
     body_inline: dict | None,
     body_path: str | None,
     content_type: str,
+    content_encoding: str = "",
 ) -> tuple[str, str, bool]:
     """
     Decode a request/response body.
@@ -74,8 +144,13 @@ def decode_body(
         else:
             raw = data_str.encode()
 
-    # Decompress gzip
-    if raw[:2] == b"\x1f\x8b":
+    # Apply Content-Encoding (br, gzip, deflate, zstd, ...) if declared.
+    decompress_err: str | None = None
+    if content_encoding:
+        raw, decompress_err = _decompress_content_encoding(raw, content_encoding)
+
+    # Fallback: sniff gzip magic for legacy/mislabelled payloads.
+    if not content_encoding and raw[:2] == b"\x1f\x8b":
         try:
             raw = gzip.decompress(raw)
         except Exception as e:
@@ -126,6 +201,9 @@ def decode_body(
         label = "binary"
 
     hex_lines = []
+    if decompress_err:
+        hex_lines.append(f"(could not decompress: {decompress_err})")
+        hex_lines.append("")
     for i in range(0, min(len(raw), 512), 16):
         chunk = raw[i : i + 16]
         hex_part = " ".join(f"{b:02x}" for b in chunk)

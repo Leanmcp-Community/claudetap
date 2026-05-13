@@ -117,6 +117,7 @@ class DetailScreen(Screen):
                 e.request.get("body_inline"),
                 e.request.get("body_path"),
                 e.req_content_type,
+                e.req_content_encoding,
             )
             label_display = label.upper()
             decoded_badge = (
@@ -183,6 +184,7 @@ class DetailScreen(Screen):
                 e.response.get("body_inline"),
                 e.response.get("body_path"),
                 e.resp_content_type,
+                e.resp_content_encoding,
             )
             label_display = label.upper()
             decoded_badge = (

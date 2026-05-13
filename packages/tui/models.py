@@ -135,6 +135,14 @@ class TrafficEntry:
         return _get_header(self.response.get("headers", []), "content-type")
 
     @property
+    def req_content_encoding(self) -> str:
+        return _get_header(self.request.get("headers", []), "content-encoding")
+
+    @property
+    def resp_content_encoding(self) -> str:
+        return _get_header(self.response.get("headers", []), "content-encoding")
+
+    @property
     def req_body_size(self) -> int:
         return self.request.get("body_size", 0) or 0
 
