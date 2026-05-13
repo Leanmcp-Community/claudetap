@@ -80,39 +80,118 @@ pub fn resolve_windsurf(explicit: Option<&Path>) -> Result<PathBuf> {
 /// Best-effort: check whether Windsurf is already running. If it is, a second
 /// launch will silently attach to the existing process and our env is dropped.
 pub fn is_windsurf_running() -> bool {
+    !running_windsurf_pids().is_empty()
+}
+
+/// Return PIDs of every running Windsurf-related process (main + helpers).
+/// Empty if none. Best-effort, cross-platform.
+pub fn running_windsurf_pids() -> Vec<u32> {
     use std::process::Command;
+    let mut pids: Vec<u32> = Vec::new();
+    let push_pgrep = |args: &[&str], out: &mut Vec<u32>| {
+        let bin = if cfg!(target_os = "macos") {
+            "/usr/bin/pgrep"
+        } else {
+            "pgrep"
+        };
+        if let Ok(o) = Command::new(bin).args(args).output() {
+            if o.status.success() {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    if let Ok(p) = line.trim().parse::<u32>() {
+                        if !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    };
+
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = Command::new("/usr/bin/pgrep")
-            .args(["-x", "Windsurf"])
-            .output()
-        {
-            if out.status.success() && !out.stdout.is_empty() {
-                return true;
-            }
-        }
-        if let Ok(out) = Command::new("/usr/bin/pgrep")
-            .args(["-f", "Windsurf.app/Contents/MacOS"])
-            .output()
-        {
-            if out.status.success() && !out.stdout.is_empty() {
-                return true;
-            }
-        }
-        false
+        // Main app binary, Electron renderer, and helper processes all live
+        // under Windsurf.app. `-f` matches against the full argv path so we
+        // catch every Helper (Renderer/GPU/Plugin) too.
+        push_pgrep(&["-f", "Windsurf.app/Contents/"], &mut pids);
+        push_pgrep(&["-i", "-f", "Windsurf Helper"], &mut pids);
+        push_pgrep(&["-x", "Windsurf"], &mut pids);
     }
     #[cfg(target_os = "linux")]
     {
-        Command::new("pgrep")
-            .args(["-x", "windsurf"])
-            .output()
-            .map(|o| o.status.success() && !o.stdout.is_empty())
-            .unwrap_or(false)
+        push_pgrep(&["-x", "windsurf"], &mut pids);
+        push_pgrep(&["-f", "windsurf"], &mut pids);
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        false
+        let _ = push_pgrep;
     }
+
+    // Never list ourselves — pgrep -f might match the claudetap process if
+    // "windsurf" appears in our own argv (it does: `claudetap windsurf`).
+    let me = std::process::id();
+    pids.retain(|&p| p != me);
+    pids
+}
+
+/// Terminate any running Windsurf processes. Sends SIGTERM first, waits up to
+/// `grace`, then SIGKILLs anything still alive. Returns the number of PIDs we
+/// signalled. Best-effort — Windsurf may also be relaunched by `launchd` or a
+/// user; we only do one pass.
+pub async fn kill_running_windsurf(grace: std::time::Duration) -> usize {
+    let pids = running_windsurf_pids();
+    if pids.is_empty() {
+        return 0;
+    }
+
+    #[cfg(unix)]
+    {
+        // If claudetap was launched from Windsurf's own integrated terminal,
+        // killing Windsurf will close our controlling tty and deliver SIGHUP
+        // to us. Ignore it so we survive long enough to relaunch Windsurf.
+        // SIGPIPE for the same reason — writes to the dead stdout would
+        // otherwise terminate us.
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
+        for &pid in &pids {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+    }
+
+    // Poll for exit; bail out early once everything is gone.
+    let start = std::time::Instant::now();
+    let poll = std::time::Duration::from_millis(150);
+    while start.elapsed() < grace {
+        if running_windsurf_pids().is_empty() {
+            return pids.len();
+        }
+        tokio::time::sleep(poll).await;
+    }
+
+    // Anything still alive gets SIGKILLed.
+    #[cfg(unix)]
+    {
+        for pid in running_windsurf_pids() {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
+    // Give the OS a moment to reap.
+    let kill_deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while std::time::Instant::now() < kill_deadline {
+        if running_windsurf_pids().is_empty() {
+            break;
+        }
+        tokio::time::sleep(poll).await;
+    }
+
+    pids.len()
 }
 
 pub async fn spawn_windsurf(spec: LaunchSpec, user_data_dir: Option<&Path>) -> Result<Child> {
