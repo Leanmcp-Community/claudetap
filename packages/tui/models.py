@@ -150,6 +150,39 @@ class TrafficEntry:
     def resp_body_size(self) -> int:
         return self.response.get("body_size", 0) or 0
 
+    @property
+    def is_stream(self) -> bool:
+        """True if response was chunked / SSE-style streamed."""
+        return bool(self.response.get("is_stream", False))
+
+    @property
+    def is_upgrade(self) -> bool:
+        """
+        True if this entry represents a protocol upgrade attempt
+        (WebSocket, HTTP/2 over h2c, etc.). Detected by:
+
+        - response status 101 (successful upgrade), OR
+        - presence of `Sec-WebSocket-Key` in the request headers (the
+          client tried to upgrade — even if claudetap currently strips
+          `Upgrade`/`Connection` and the server replied 404/426).
+        """
+        if self.status == 101:
+            return True
+        return bool(_get_header(self.request.get("headers", []), "sec-websocket-key"))
+
+    @property
+    def stream_marker(self) -> str:
+        """Single-character flag for the request list:
+            '*' streamed (chunked/SSE)
+            '↑' WebSocket / protocol upgrade
+            ''  neither
+        """
+        if self.is_upgrade:
+            return "↑"
+        if self.is_stream:
+            return "*"
+        return ""
+
 
 def _get_header(headers: list, name: str) -> str:
     for h, v in headers:

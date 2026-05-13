@@ -100,7 +100,8 @@ class RequestListScreen(Screen):
     def _populate_table(self) -> None:
         table = self.query_one("#request-table", DataTable)
         table.clear(columns=True)
-        table.add_columns("#", "TIME", "METHOD", "STATUS", "URL")
+        # Single-char flag column: '*' = streamed, '↑' = WS/upgrade, blank = none.
+        table.add_columns("#", "TIME", "METHOD", "STATUS", " ", "URL")
 
         for i, e in enumerate(self._filtered_entries, 1):
             status_str = str(e.status or "?")
@@ -117,11 +118,19 @@ class RequestListScreen(Screen):
             else:
                 status_text.stylize("dim")
 
+            marker = e.stream_marker
+            marker_text = Text(marker)
+            if marker == "↑":
+                marker_text.stylize("bold magenta")
+            elif marker == "*":
+                marker_text.stylize("bold cyan")
+
             table.add_row(
                 str(i),
                 e.time_short,
                 e.method,
                 status_text,
+                marker_text,
                 e.url_short,
                 key=str(i - 1),  # index into _filtered_entries
             )
@@ -236,12 +245,23 @@ class RequestListScreen(Screen):
     def on_filter_submitted(self, event: Input.Submitted) -> None:
         self._filter_text = event.value.strip().lower()
         if self._filter_text:
-            self._filtered_entries = [
-                e for e in self._all_entries
-                if self._filter_text in e.url.lower()
-                or self._filter_text in e.method.lower()
-                or self._filter_text in str(e.status or "").lower()
-            ]
+            ft = self._filter_text
+            # Special tokens for finding flagged entries quickly
+            if ft in ("ws", "websocket", "upgrade"):
+                self._filtered_entries = [
+                    e for e in self._all_entries if e.is_upgrade
+                ]
+            elif ft in ("stream", "streamed", "sse"):
+                self._filtered_entries = [
+                    e for e in self._all_entries if e.is_stream
+                ]
+            else:
+                self._filtered_entries = [
+                    e for e in self._all_entries
+                    if ft in e.url.lower()
+                    or ft in e.method.lower()
+                    or ft in str(e.status or "").lower()
+                ]
         else:
             self._filtered_entries = list(self._all_entries)
         self._populate_table()
