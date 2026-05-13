@@ -527,44 +527,122 @@ async fn handle_request_inner(
         let resp = Response::from_parts(resp_parts, new_body);
         Ok(resp)
     } else {
-        // Buffer non-streaming responses in full so we can log them cleanly.
-        let collected = resp_body
-            .collect()
-            .await
-            .map_err(|e| anyhow!("reading upstream response body: {e}"))?
-            .to_bytes();
+        // Generic stream-tee for all non-SSE responses.
+        //
+        // The OLD code called `resp_body.collect().await` here, which held
+        // every byte until upstream EOF before sending a single byte to the
+        // client. That broke streaming for any chunked response that isn't
+        // `text/event-stream` — notably Windsurf / Cognition APIs, which
+        // stream tokens as chunked JSON, gRPC-Web, or Connect. Users saw the
+        // entire response materialise at once instead of streaming.
+        //
+        // Now we forward each frame as it arrives, while also accumulating
+        // the body in memory so the post-EOF log record still has the full
+        // payload. Bounded-size response bodies (API completions) make the
+        // memory cost acceptable; if this ever needs to support multi-GB
+        // downloads we should switch to `append_response_chunk` for on-disk
+        // streaming.
+        let mut resp_parts = resp_parts;
+        // Drop framing headers from upstream — hyper will re-emit
+        // `Transfer-Encoding: chunked` (or honor `Content-Length`) itself
+        // based on the body we hand it. Leaving the original headers can
+        // double up `Transfer-Encoding` and break some HTTP/1.1 clients.
+        strip_hop_by_hop(&mut resp_parts.headers);
 
-        let (resp_body_size, resp_body_path, resp_body_inline) =
-            logger.store_response_body(&req_id, &collected).await?;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut done_tx = Some(done_tx);
+        let buf_for_finalize = buf.clone();
 
-        let record = TrafficRecord {
-            id: req_id.clone(),
-            ts_start,
-            ts_end: OffsetDateTime::now_utc(),
-            method: req_method.as_str().to_string(),
-            url,
-            http_version: http_version_str,
-            upstream_addr: Some(format!("{host}:{port}")),
-            request: SidePayload {
-                headers: logger.redact_headers(&req_headers_capture),
-                body_size: req_body_size,
-                body_inline: req_body_inline,
-                body_path: req_body_path,
+        let st = stream::unfold(
+            (resp_body, buf.clone()),
+            |(mut body, buf)| async move {
+                match body.frame().await {
+                    None => None,
+                    Some(Ok(frame)) => {
+                        if let Some(data) = frame.data_ref() {
+                            let mut b = buf.lock().await;
+                            b.extend_from_slice(data);
+                        }
+                        Some((Ok::<_, BoxError>(frame), (body, buf)))
+                    }
+                    Some(Err(e)) => Some((Err(Box::new(e) as BoxError), (body, buf))),
+                }
             },
-            response: ResponsePayload {
-                status: resp_status,
-                headers: logger.redact_headers(&resp_headers_capture),
-                body_size: resp_body_size,
-                body_inline: resp_body_inline,
-                body_path: resp_body_path,
-                is_stream: false,
-                stream_path: None,
-            },
-            error: None,
-        };
-        logger.append_traffic(&record).await?;
+        );
 
-        let resp = Response::from_parts(resp_parts, full_body(collected));
+        let st = st.chain(stream::once(async move {
+            if let Some(tx) = done_tx.take() {
+                let _ = tx.send(());
+            }
+            Ok::<_, BoxError>(Frame::data(Bytes::new()))
+        }));
+
+        let new_body: BodyOut = BodyExt::boxed(StreamBody::new(st));
+
+        let logger_for_record = logger.clone();
+        let req_id_for_record = req_id.clone();
+        let method_for_record = req_method.as_str().to_string();
+        let url_for_record = url.clone();
+        let http_version_for_record = http_version_str.clone();
+        let upstream_addr = format!("{host}:{port}");
+        let req_headers_capture_owned = req_headers_capture.clone();
+        let resp_headers_capture_owned = resp_headers_capture.clone();
+        let req_body_size_owned = req_body_size;
+        let req_body_inline_owned = req_body_inline.clone();
+        let req_body_path_owned = req_body_path.clone();
+        let host_for_record = host.clone();
+
+        tokio::spawn(async move {
+            let _ = done_rx.await;
+            let bytes = {
+                let mut b = buf_for_finalize.lock().await;
+                std::mem::take(&mut *b)
+            };
+            let collected = Bytes::from(bytes);
+            let (resp_body_size, resp_body_path, resp_body_inline) =
+                match logger_for_record
+                    .store_response_body(&req_id_for_record, &collected)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "storing streamed response body");
+                        (collected.len(), None, None)
+                    }
+                };
+            let record = TrafficRecord {
+                id: req_id_for_record,
+                ts_start,
+                ts_end: OffsetDateTime::now_utc(),
+                method: method_for_record,
+                url: url_for_record,
+                http_version: http_version_for_record,
+                upstream_addr: Some(upstream_addr),
+                request: SidePayload {
+                    headers: logger_for_record.redact_headers(&req_headers_capture_owned),
+                    body_size: req_body_size_owned,
+                    body_inline: req_body_inline_owned,
+                    body_path: req_body_path_owned,
+                },
+                response: ResponsePayload {
+                    status: resp_status,
+                    headers: logger_for_record.redact_headers(&resp_headers_capture_owned),
+                    body_size: resp_body_size,
+                    body_inline: resp_body_inline,
+                    body_path: resp_body_path,
+                    is_stream: false,
+                    stream_path: None,
+                },
+                error: None,
+            };
+            if let Err(e) = logger_for_record.append_traffic(&record).await {
+                warn!(error = %e, "writing traffic record (streamed)");
+            }
+            let _ = host_for_record;
+        });
+
+        let resp = Response::from_parts(resp_parts, new_body);
         Ok(resp)
     }
 }
