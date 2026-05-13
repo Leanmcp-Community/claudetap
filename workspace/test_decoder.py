@@ -95,6 +95,29 @@ def main() -> int:
         "",
     )
 
+    # NDJSON labelled as application/json (1DS Web SDK telemetry pattern)
+    ndjson = (
+        b'{"name":"monacoworkbench/extHostDeprecatedApiUsage",'
+        b'"time":"2026-05-13T10:13:41.196Z","ver":"4.0"}\n'
+        b'{"name":"editor/autoSave","time":"2026-05-13T10:13:42.001Z"}\n'
+        b'{"name":"workbench/heartbeat","time":"2026-05-13T10:13:43.500Z"}\n'
+    )
+    case(
+        "NDJSON as application/json (1DS telemetry style)",
+        ndjson,
+        "application/json",
+        "",
+    )
+
+    # application/json that's neither single JSON nor valid NDJSON — should
+    # still come back as readable text instead of a hex dump.
+    case(
+        "garbled JSON-typed body falls back to text",
+        b'{"truncated":',
+        "application/json",
+        "",
+    )
+
     # body_path resolved against session_dir
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:

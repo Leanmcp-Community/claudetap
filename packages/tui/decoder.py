@@ -80,6 +80,34 @@ def _decompress_content_encoding(
     return raw, None
 
 
+def _try_ndjson(raw: bytes) -> str | None:
+    """
+    Parse newline-delimited JSON (aka NDJSON, x-json-stream).
+
+    Used by telemetry SDKs like Microsoft's 1DS Web SDK, which POSTs many
+    event records as one `{...}\\n{...}\\n…` payload but still sets
+    `content-type: application/json`. Returns a pretty-printed multi-record
+    string, or None if the body isn't valid NDJSON (single line, or any
+    line that fails to parse).
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if len(lines) < 2:
+        return None
+    out: list[str] = []
+    for i, ln in enumerate(lines, 1):
+        try:
+            obj = json.loads(ln)
+        except json.JSONDecodeError:
+            return None
+        out.append(f"── record {i}/{len(lines)} ──")
+        out.append(json.dumps(obj, indent=2, ensure_ascii=False))
+    return "\n".join(out)
+
+
 def _format_git_pkt_lines(raw: bytes) -> str | None:
     """
     Parse git smart-HTTP pkt-line framing (protocol v2).
@@ -212,12 +240,23 @@ def decode_body(
 
     ct = content_type.lower()
 
-    # JSON
+    # JSON (single object) or NDJSON / x-json-stream (one object per line)
     if "json" in ct or ct == "":
         try:
             obj = json.loads(raw)
             return json.dumps(obj, indent=2, ensure_ascii=False), "json", True
         except Exception:
+            pass
+        ndjson = _try_ndjson(raw)
+        if ndjson is not None:
+            return ndjson, "ndjson", True
+        # Last-ditch: it's labelled JSON but neither parser likes it. Show
+        # it as text rather than a hex dump — almost certainly still readable
+        # (truncated upload, NDJSON with a junk byte, etc.).
+        try:
+            text = raw.decode("utf-8")
+            return text, "text", True
+        except UnicodeDecodeError:
             pass
 
     # Plaintext

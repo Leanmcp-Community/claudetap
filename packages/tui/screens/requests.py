@@ -52,6 +52,11 @@ class RequestListScreen(Screen):
         ("q", "quit", "Quit"),
         ("slash", "toggle_filter", "Filter"),
         ("c", "copy_url", "Copy URL"),
+        ("r", "refresh", "Refresh"),
+        ("G", "goto_end", "End"),
+        Binding("end", "goto_end", "End", show=False),
+        Binding("g", "goto_start", "Start", show=False),
+        Binding("home", "goto_start", "Start", show=False),
     ]
 
     def __init__(self, session: SessionMeta) -> None:
@@ -60,6 +65,9 @@ class RequestListScreen(Screen):
         self._all_entries: list[TrafficEntry] = []
         self._filtered_entries: list[TrafficEntry] = []
         self._filter_text = ""
+        # (prev_row, was_at_end) — set by action_refresh, consumed by
+        # _populate_table once the new entries are loaded.
+        self._refresh_pending_anchor: tuple[int, bool] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -130,6 +138,20 @@ class RequestListScreen(Screen):
             f" 📋 {sid_short}  [bold]{target}[/bold]  {started}  —  {count_str} requests"
         )
 
+        # Restore cursor after a refresh: if user was at the bottom, pin to
+        # the new bottom (so newly-captured rows are visible); otherwise hold
+        # the previous row index.
+        if self._refresh_pending_anchor is not None and table.row_count > 0:
+            prev_row, was_at_end = self._refresh_pending_anchor
+            self._refresh_pending_anchor = None
+            if was_at_end:
+                target_row = table.row_count - 1
+                table.move_cursor(row=target_row, animate=False)
+                table.scroll_end(animate=False)
+            else:
+                target_row = min(prev_row, table.row_count - 1)
+                table.move_cursor(row=target_row, animate=False)
+
     @on(DataTable.RowSelected, "#request-table")
     def on_request_selected(self, event: DataTable.RowSelected) -> None:
         idx = int(event.row_key.value)
@@ -158,6 +180,34 @@ class RequestListScreen(Screen):
 
     def action_quit(self) -> None:
         self.app.exit()
+
+    def action_refresh(self) -> None:
+        """Reload entries from disk — picks up new requests captured since
+        the screen was opened."""
+        # Remember where the user was so the cursor stays roughly put after
+        # rows are appended. If they were already at the bottom, keep them
+        # pinned to the new bottom.
+        table = self.query_one("#request-table", DataTable)
+        prev_row = table.cursor_row if table.cursor_row is not None else 0
+        was_at_end = prev_row >= max(0, len(self._filtered_entries) - 1)
+        self._refresh_pending_anchor = (prev_row, was_at_end)
+        self._load_entries()
+        self.notify("Refreshing…", severity="information", timeout=1)
+
+    def action_goto_end(self) -> None:
+        """Jump cursor to the last entry."""
+        table = self.query_one("#request-table", DataTable)
+        last = max(0, len(self._filtered_entries) - 1)
+        if last >= 0 and table.row_count > 0:
+            table.move_cursor(row=last, animate=False)
+            table.scroll_end(animate=False)
+
+    def action_goto_start(self) -> None:
+        """Jump cursor to the first entry."""
+        table = self.query_one("#request-table", DataTable)
+        if table.row_count > 0:
+            table.move_cursor(row=0, animate=False)
+            table.scroll_home(animate=False)
 
     def action_copy_url(self) -> None:
         """Copy the selected row's URL to the system clipboard."""
