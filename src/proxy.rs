@@ -245,10 +245,18 @@ async fn mitm_tunnel(
         async move { Ok::<_, Infallible>(handle_request(req, state, host, port).await) }
     });
 
+    // .with_upgrades() is REQUIRED for WebSocket: without it, hyper
+    // happily forwards the 101 status to the client but never hands the
+    // upgraded I/O to `hyper::upgrade::on(&mut req)`, so the WS log file
+    // gets opened (handshake detection succeeds) and then both
+    // `req_upgrade_fut.await` and `upstream_upgrade_fut.await` hang
+    // forever. Result: empty .ws.jsonl. The outer server (CONNECT
+    // tunnel) already has this; the inner MITM server needs it too.
     server_http1::Builder::new()
         .preserve_header_case(true)
         .title_case_headers(true)
         .serve_connection(io, svc)
+        .with_upgrades()
         .await
         .map_err(|e| anyhow!("downstream serve: {e}"))?;
     Ok(())
@@ -399,8 +407,14 @@ async fn handle_request_inner(
     let (mut sender, conn) = hyper::client::conn::http1::handshake(upstream_io)
         .await
         .with_context(|| "upstream HTTP/1.1 handshake")?;
+    // Mirror the server-side .with_upgrades(): the upstream connection
+    // driver also needs this to surrender its I/O to
+    // `hyper::upgrade::on(&mut upstream_resp)` after a 101. Without it,
+    // the upstream upgrade future never resolves and `proxy_ws_stream`
+    // never starts on the s2c half — so even if the downstream client
+    // sends frames they have nowhere to go.
     tokio::spawn(async move {
-        if let Err(e) = conn.await {
+        if let Err(e) = conn.with_upgrades().await {
             debug!(error = %e, "upstream connection closed");
         }
     });
