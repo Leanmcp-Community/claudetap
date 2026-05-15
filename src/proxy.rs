@@ -311,6 +311,8 @@ async fn handle_request(
                     body_path: None,
                     is_stream: false,
                     stream_path: None,
+                    is_websocket: false,
+                    ws_path: None,
                 },
                 error: Some(err.to_string()),
             };
@@ -330,6 +332,19 @@ async fn handle_request_inner(
 ) -> Result<Response<BodyOut>> {
     let logger = state.logger.clone();
 
+    let mut req = req;
+    let is_ws_handshake = req.method() == Method::GET
+        && req.headers().get(http::header::CONNECTION).map(|v| v.to_str().unwrap_or("").to_ascii_lowercase().contains("upgrade")).unwrap_or(false)
+        && req.headers().get(http::header::UPGRADE).map(|v| v.to_str().unwrap_or("").to_ascii_lowercase() == "websocket").unwrap_or(false)
+        && req.headers().contains_key("sec-websocket-key")
+        && req.headers().get("sec-websocket-version").map(|v| v.as_bytes() == b"13").unwrap_or(false);
+
+    let mut req_upgrade = if is_ws_handshake {
+        Some(hyper::upgrade::on(&mut req))
+    } else {
+        None
+    };
+
     let (mut parts, body) = req.into_parts();
     let req_method = parts.method.clone();
     let req_uri = parts.uri.clone();
@@ -348,7 +363,7 @@ async fn handle_request_inner(
     }
     // Strip hop-by-hop headers. The proxy is not transparent, so we don't want
     // to forward `proxy-connection` etc.
-    strip_hop_by_hop(&mut parts.headers);
+    strip_hop_by_hop(&mut parts.headers, is_ws_handshake);
 
     let req_headers_capture = capture_headers(&parts.headers);
 
@@ -391,13 +406,120 @@ async fn handle_request_inner(
     });
 
     let upstream_req = Request::from_parts(parts, Full::new(req_body_bytes.clone()));
-    let upstream_resp = sender
+    let mut upstream_resp = sender
         .send_request(upstream_req)
         .await
         .with_context(|| "send_request upstream")?;
 
+    let is_ws_101 = is_ws_handshake && upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS;
+    let mut upstream_upgrade = if is_ws_101 {
+        Some(hyper::upgrade::on(&mut upstream_resp))
+    } else {
+        None
+    };
+
     let (resp_parts, resp_body) = upstream_resp.into_parts();
     let resp_status = resp_parts.status.as_u16();
+
+    if is_ws_101 {
+        let mut resp_parts = resp_parts;
+        strip_hop_by_hop(&mut resp_parts.headers, true);
+
+        let logger_for_record = logger.clone();
+        let req_id_for_record = req_id.clone();
+        let method_for_record = req_method.as_str().to_string();
+        let url_for_record = url.clone();
+        let http_version_for_record = http_version_str.clone();
+        let upstream_addr = format!("{host}:{port}");
+        let req_headers_capture_owned = req_headers_capture.clone();
+        let resp_headers_capture = capture_headers(&resp_parts.headers);
+        let resp_headers_capture_owned = resp_headers_capture.clone();
+        let req_body_size_owned = req_body_size;
+        let req_body_inline_owned = req_body_inline.clone();
+        let req_body_path_owned = req_body_path.clone();
+
+        let req_upgrade_fut = req_upgrade.take().unwrap();
+        let upstream_upgrade_fut = upstream_upgrade.take().unwrap();
+
+        let (ws_rel_path, ws_file) = match logger_for_record.open_ws_log(&req_id_for_record).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to open ws log file");
+                return Ok(Response::from_parts(resp_parts, empty_body()));
+            }
+        };
+        let ws_file = std::sync::Arc::new(tokio::sync::Mutex::new(ws_file));
+
+        tokio::spawn(async move {
+            let down = match req_upgrade_fut.await {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(error = %e, "downstream WS upgrade failed");
+                    return;
+                }
+            };
+            let up = match upstream_upgrade_fut.await {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(error = %e, "upstream WS upgrade failed");
+                    return;
+                }
+            };
+
+            let down_io = hyper_util::rt::TokioIo::new(down);
+            let up_io = hyper_util::rt::TokioIo::new(up);
+
+            let (down_rx, down_tx) = tokio::io::split(down_io);
+            let (up_rx, up_tx) = tokio::io::split(up_io);
+
+            let logger_up = ws_file.clone();
+            let logger_down = ws_file.clone();
+
+            let up_task = tokio::spawn(async move {
+                let _ = crate::ws::proxy_ws_stream(down_rx, up_tx, "c2s", logger_up).await;
+            });
+
+            let down_task = tokio::spawn(async move {
+                let _ = crate::ws::proxy_ws_stream(up_rx, down_tx, "s2c", logger_down).await;
+            });
+
+            let _ = tokio::join!(up_task, down_task);
+
+            let record = TrafficRecord {
+                id: req_id_for_record,
+                ts_start,
+                ts_end: OffsetDateTime::now_utc(),
+                method: method_for_record,
+                url: url_for_record,
+                http_version: http_version_for_record,
+                upstream_addr: Some(upstream_addr),
+                request: SidePayload {
+                    headers: logger_for_record.redact_headers(&req_headers_capture_owned),
+                    body_size: req_body_size_owned,
+                    body_inline: req_body_inline_owned,
+                    body_path: req_body_path_owned,
+                },
+                response: ResponsePayload {
+                    status: resp_status,
+                    headers: logger_for_record.redact_headers(&resp_headers_capture_owned),
+                    body_size: 0,
+                    body_inline: None,
+                    body_path: None,
+                    is_stream: false,
+                    stream_path: None,
+                    is_websocket: true,
+                    ws_path: Some(ws_rel_path),
+                },
+                error: None,
+            };
+            if let Err(e) = logger_for_record.append_traffic(&record).await {
+                warn!(error = %e, "writing WS traffic record");
+            }
+        });
+
+        return Ok(Response::from_parts(resp_parts, empty_body()));
+    }
+
     let resp_headers_capture = capture_headers(&resp_parts.headers);
     let is_sse = resp_parts
         .headers
@@ -515,6 +637,8 @@ async fn handle_request_inner(
                     body_path: None,
                     is_stream: true,
                     stream_path: Some(stream_rel_for_record),
+                    is_websocket: false,
+                    ws_path: None,
                 },
                 error: None,
             };
@@ -547,7 +671,7 @@ async fn handle_request_inner(
         // `Transfer-Encoding: chunked` (or honor `Content-Length`) itself
         // based on the body we hand it. Leaving the original headers can
         // double up `Transfer-Encoding` and break some HTTP/1.1 clients.
-        strip_hop_by_hop(&mut resp_parts.headers);
+        strip_hop_by_hop(&mut resp_parts.headers, false);
 
         let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -633,6 +757,8 @@ async fn handle_request_inner(
                     body_path: resp_body_path,
                     is_stream: false,
                     stream_path: None,
+                    is_websocket: false,
+                    ws_path: None,
                 },
                 error: None,
             };
@@ -654,8 +780,8 @@ fn capture_headers(headers: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
-    const HOP: &[&str] = &[
+fn strip_hop_by_hop(headers: &mut http::HeaderMap, is_ws_handshake: bool) {
+    let mut hop = vec![
         "connection",
         "proxy-connection",
         "keep-alive",
@@ -666,7 +792,10 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
         "proxy-authenticate",
         "proxy-authorization",
     ];
-    for h in HOP {
+    if is_ws_handshake {
+        hop.retain(|&h| h != "connection" && h != "upgrade");
+    }
+    for h in hop {
         if let Ok(name) = HeaderName::from_bytes(h.as_bytes()) {
             headers.remove(&name);
         }

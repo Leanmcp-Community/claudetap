@@ -18,6 +18,7 @@ mod log;
 mod paths;
 mod proxy;
 mod sse;
+mod ws;
 
 const DEFAULT_HOSTS: &[&str] = &[
     "api.anthropic.com",

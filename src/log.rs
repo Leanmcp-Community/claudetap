@@ -153,6 +153,10 @@ pub struct ResponsePayload {
     pub body_path: Option<String>,
     pub is_stream: bool,
     pub stream_path: Option<String>,
+    #[serde(default)]
+    pub is_websocket: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ws_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,6 +173,13 @@ impl InlineBody {
         match std::str::from_utf8(bytes) {
             Ok(s) => InlineBody::Utf8(s.to_string()),
             Err(_) => InlineBody::Base64(b64::encode(bytes)),
+        }
+    }
+
+    pub fn to_b64(&self) -> String {
+        match self {
+            InlineBody::Utf8(s) => b64::encode(s.as_bytes()),
+            InlineBody::Base64(s) => s.clone(),
         }
     }
 }
@@ -370,6 +381,18 @@ impl SessionLogger {
     pub async fn open_stream_log(&self, req_id: &str) -> Result<(String, tokio::fs::File)> {
         let rel = format!("stream/{req_id}.sse.jsonl");
         let path = self.stream_dir.join(format!("{req_id}.sse.jsonl"));
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .with_context(|| format!("opening {}", path.display()))?;
+        Ok((rel, file))
+    }
+
+    pub async fn open_ws_log(&self, req_id: &str) -> Result<(String, tokio::fs::File)> {
+        let rel = format!("stream/{req_id}.ws.jsonl");
+        let path = self.stream_dir.join(format!("{req_id}.ws.jsonl"));
         let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)

@@ -167,9 +167,39 @@ class DetailScreen(Screen):
         # Body / Stream
         is_stream = e.response.get("is_stream", False)
         stream_path = e.response.get("stream_path")
+        is_websocket = e.response.get("is_websocket", False)
+        ws_path = e.response.get("ws_path")
         resp_size = e.resp_body_size
 
-        if is_stream and stream_path:
+        if is_websocket and ws_path:
+            lines.append("")
+            lines.append(f"  [dim]WebSocket UPGRADED → {_escape(ws_path)}[/dim]")
+            p = Path(ws_path)
+            if not p.is_absolute() and self.session_dir is not None:
+                p = self.session_dir / p
+            if p.exists():
+                import json
+                ws_lines = p.read_text(errors="replace").splitlines()
+                show = ws_lines[:80]
+                for sl in show:
+                    try:
+                        frame = json.loads(sl)
+                        arr = "→" if frame.get("dir") == "c2s" else "←"
+                        col = "green" if frame.get("dir") == "c2s" else "cyan"
+                        op = frame.get("op", "?")
+                        ln = frame.get("len", 0)
+                        lines.append(f"  [{col}]{arr}[/{col}] [bold]{op}[/bold] [dim]len={ln}[/dim]")
+                        if frame.get("payload"):
+                            lines.append(f"      {_escape(frame['payload'])}")
+                        elif frame.get("payload_b64"):
+                            lines.append(f"      [dim]b64: {_escape(frame['payload_b64'])}[/dim]")
+                    except:
+                        lines.append(f"    {_escape(sl)}")
+                if len(ws_lines) > 80:
+                    lines.append(
+                        f"    [dim]… {len(ws_lines) - 80} more lines[/dim]"
+                    )
+        elif is_stream and stream_path:
             lines.append("")
             lines.append(f"  [dim]streaming SSE → {_escape(stream_path)}[/dim]")
             p = Path(stream_path)
