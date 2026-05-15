@@ -407,6 +407,10 @@ impl SessionLogger {
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
         file.write_all(&line).await?;
+        // Match the WS log: flush per event so other readers (Python
+        // tools, `tail -f`, the TUI detail view) see SSE events the
+        // moment they're parsed, not when the response stream closes.
+        file.flush().await?;
         Ok(())
     }
 

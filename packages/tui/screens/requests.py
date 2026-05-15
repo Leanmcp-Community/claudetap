@@ -57,6 +57,16 @@ class RequestListScreen(Screen):
         Binding("end", "goto_end", "End", show=False),
         Binding("g", "goto_start", "Start", show=False),
         Binding("home", "goto_start", "Start", show=False),
+        # Page-jump aliases. `o` jumps up a screenful, `k` jumps down a
+        # screenful — easier to reach on a laptop keyboard than PgUp/PgDn.
+        # ctrl+x mirrors `k` because muscle memory wants a Ctrl chord.
+        ("o", "page_up", "Page ↑"),
+        ("k", "page_down", "Page ↓"),
+        Binding("pageup", "page_up", "Page ↑", show=False),
+        Binding("pagedown", "page_down", "Page ↓", show=False),
+        Binding("ctrl+x", "page_down", "Page ↓", show=False),
+        Binding("ctrl+u", "page_up", "Page ↑", show=False),
+        Binding("ctrl+d", "page_down", "Page ↓", show=False),
     ]
 
     def __init__(self, session: SessionMeta) -> None:
@@ -217,6 +227,37 @@ class RequestListScreen(Screen):
         if table.row_count > 0:
             table.move_cursor(row=0, animate=False)
             table.scroll_home(animate=False)
+
+    def _page_size(self) -> int:
+        """How many rows fit in the visible table area. Falls back to 10
+        until the table has been laid out."""
+        table = self.query_one("#request-table", DataTable)
+        # `size.height` includes the header row; subtract 1 for that and
+        # 1 more so the cursor stays inside the visible window after the
+        # jump. Clamp to >= 1 so we never freeze on a tiny pane.
+        page = max(1, table.size.height - 2)
+        return page
+
+    def action_page_up(self) -> None:
+        """Jump the cursor up by one screenful of rows."""
+        table = self.query_one("#request-table", DataTable)
+        if table.row_count == 0:
+            return
+        cur = table.cursor_row or 0
+        new_row = max(0, cur - self._page_size())
+        table.move_cursor(row=new_row, animate=False)
+        # Keep the cursor visible at the top of the viewport.
+        table.scroll_to(0, new_row, animate=False)
+
+    def action_page_down(self) -> None:
+        """Jump the cursor down by one screenful of rows."""
+        table = self.query_one("#request-table", DataTable)
+        if table.row_count == 0:
+            return
+        cur = table.cursor_row or 0
+        new_row = min(table.row_count - 1, cur + self._page_size())
+        table.move_cursor(row=new_row, animate=False)
+        table.scroll_to(0, new_row, animate=False)
 
     def action_copy_url(self) -> None:
         """Copy the selected row's URL to the system clipboard."""

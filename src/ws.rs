@@ -139,6 +139,14 @@ where
         
         let mut f = log_file.lock().await;
         f.write_all(&line).await?;
+        // Flush every frame so `tail -f`, the Python `inspect_ws.py`, and the
+        // TUI detail view see frames the moment they arrive — instead of
+        // waiting for the connection to close (which is what an unflushed
+        // tokio::fs::File can effectively do once the OS page cache is
+        // involved). This is per-frame work but each frame is already a
+        // small JSON line so the syscall overhead is negligible compared
+        // to the TLS+forward path we already pay.
+        f.flush().await?;
     }
     Ok(())
 }
