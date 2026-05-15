@@ -16,6 +16,8 @@ cargo install --path "${SCRIPT_DIR}" --color never "$@"
 
 BIN_PATH="${CARGO_HOME:-$HOME/.cargo}/bin/claudetap"
 if [[ -x "${BIN_PATH}" ]]; then
+    # Send install event to PostHog
+    "${BIN_PATH}" install-telemetry || true
     echo ">>> Installed: ${BIN_PATH}"
     case ":${PATH}:" in
         *":${CARGO_HOME:-$HOME/.cargo}/bin:"*) ;;

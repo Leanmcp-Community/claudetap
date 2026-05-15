@@ -22,6 +22,18 @@ fn main() {
     let suffix = if dirty { "-dirty" } else { "" };
     println!("cargo:rustc-env=CLAUDETAP_GIT_HASH={hash}{suffix}");
 
+    // Load POSTHOG_API_KEY from .env if present, otherwise set the default key
+    let mut posthog_key = "phc_EoMHKFbx6j2wUFsf8ywqgHntY4vEXC3ZzLFoPJVjRRT".to_string();
+    if let Ok(env_content) = std::fs::read_to_string(".env") {
+        for line in env_content.lines() {
+            if let Some(rest) = line.strip_prefix("POSTHOG_API_KEY=") {
+                posthog_key = rest.trim().to_string();
+                break;
+            }
+        }
+    }
+    println!("cargo:rustc-env=POSTHOG_API_KEY={posthog_key}");
+
     // Re-run when these change so the embedded hash stays in sync. cargo's
     // default rerun rules already cover source files; we just need the
     // git pointers.
