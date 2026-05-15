@@ -20,6 +20,17 @@ mod proxy;
 mod sse;
 mod ws;
 
+/// Version string shown by `claudetap --version`. Composed of the
+/// crate version from Cargo.toml plus the short git hash (with a
+/// `-dirty` suffix if the working tree had uncommitted changes at
+/// build time). The git hash comes from `build.rs`.
+const CLAUDETAP_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("CLAUDETAP_GIT_HASH"),
+    ")",
+);
+
 const DEFAULT_HOSTS: &[&str] = &[
     "api.anthropic.com",
     "*.anthropic.com",
@@ -62,7 +73,7 @@ const WINDSURF_HOSTS: &[&str] = &[
 #[derive(Parser, Debug)]
 #[command(
     name = "claudetap",
-    version,
+    version = CLAUDETAP_VERSION,
     about = "Tap Claude Code's HTTPS traffic into ~/.claudetap (logs are kept forever).",
     disable_help_subcommand = true
 )]

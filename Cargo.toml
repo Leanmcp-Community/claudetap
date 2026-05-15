@@ -1,9 +1,10 @@
 [package]
 name = "claudetap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Local HTTPS MITM proxy that taps Claude Code traffic into ~/.claudetap"
 license = "MIT"
+build = "build.rs"
 
 [[bin]]
 name = "claudetap"
