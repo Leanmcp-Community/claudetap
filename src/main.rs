@@ -857,60 +857,6 @@ fn page_size_bytes() -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-fn hostname() -> Option<String> {
-    if let Ok(h) = std::env::var("HOSTNAME") {
-        return Some(h);
-    }
-    let out = std::process::Command::new("hostname").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn detect_claude_version(claude_path: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new(claude_path).arg("--version").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let v = s.lines().next()?.trim().to_string();
-    if v.is_empty() { None } else { Some(v) }
-}
-
-async fn supervise_child(child: &mut tokio::process::Child, pid: Option<u32>) -> Option<i32> {
-    // Escalate signals to ensure we don't get stuck if the child hangs
-    tokio::select! {
-        status = child.wait() => {
-            status.ok().and_then(|s| s.code())
-        }
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\nclaudetap: caught Ctrl-C, killing child...");
-            if let Some(p) = pid {
-                let _ = launcher::kill_claude(p).await;
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            None
-        }
-    }
-}
-
-async fn wait_for_shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
-}
-
-fn write_last_session_pointer(session_id: &str, session_dir: &std::path::Path, proxy_url: &str) -> Result<()> {
-    let pointer_path = paths::root()?.join("last_session.json");
-    let content = serde_json::json!({
-        "session_id": session_id,
-        "session_dir": session_dir,
-        "proxy_url": proxy_url,
-        "timestamp": OffsetDateTime::now_utc().to_string()
-    });
-    std::fs::write(pointer_path, serde_json::to_string_pretty(&content)?)?;
-    Ok(())
-}
 
 fn track_install_event() {
     let flag_path = paths::root().unwrap_or_else(|_| dirs::home_dir().unwrap().join(".claudetap")).join(".installed");
@@ -940,11 +886,7 @@ fn track_install_event() {
     });
 }
 
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
-}
+
 
 #[cfg(target_os = "linux")]
 fn page_size_bytes() -> Option<u64> {
