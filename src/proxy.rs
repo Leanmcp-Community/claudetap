@@ -375,6 +375,40 @@ async fn handle_request_inner(
 
     let req_headers_capture = capture_headers(&parts.headers);
 
+    // Force upstream responses to be uncompressed.
+    //
+    // This is done AFTER `capture_headers` above so the recorded request
+    // still shows the *client's* original `accept-encoding` (e.g. claude's
+    // `gzip, deflate, br, zstd`) — useful for debugging the client.
+    //
+    // Why we override it on the wire: Anthropic's `text/event-stream`
+    // responses are returned with `content-encoding: gzip` whenever the
+    // client advertises gzip support. The previous code fed those gzip
+    // bytes straight into `SseParser`, which scans for the `\n\n` event
+    // delimiter. Compressed bytes virtually never contain that pattern,
+    // so essentially zero events were parsed; the only thing the parser
+    // ever emitted was the occasional spurious empty event whenever a
+    // random byte run happened to look like `data:\n\n`. That's why
+    // `stream/<id>.sse.jsonl` files for `/v1/messages` were ending up
+    // with one stray `{"event":null,"data":""}` line and nothing else,
+    // even though the wire carried thousands of real SSE bytes.
+    //
+    // claudetap is a debugging proxy on localhost — wire compression
+    // saves nothing here and only hurts inspection. Forcing `identity`
+    // upstream gives us plaintext SSE we can actually parse, plaintext
+    // JSON bodies in `bodies/`, and the TUI continues to work because
+    // its body decoder already treats unencoded payloads as the common
+    // case (see `packages/tui/decoder.py`).
+    //
+    // Skipped for the WebSocket handshake — `accept-encoding` is
+    // meaningless there and we don't want to perturb the upgrade.
+    if !is_ws_handshake {
+        parts.headers.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("identity"),
+        );
+    }
+
     // Buffer the request body. For Anthropic API requests these are small JSON
     // payloads; buffering is fine and lets us log the exact bytes.
     let req_body_bytes: Bytes = body
