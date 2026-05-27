@@ -14,8 +14,10 @@ from ..decoder import decode_body, duration_ms
 from ..models import TrafficEntry
 
 
-# Max lines to show before truncating a body
+# Max lines to show before truncating a body (when collapsed).
 BODY_COLLAPSE_THRESHOLD = 50
+# Max lines to show for streamed SSE / WebSocket transcripts (when collapsed).
+STREAM_COLLAPSE_THRESHOLD = 80
 
 
 def _method_colour(m: str) -> str:
@@ -52,6 +54,14 @@ class DetailScreen(Screen):
         ("p", "prev_entry", "Prev"),
         Binding("right", "next_entry", "Next →", show=False),
         Binding("left", "prev_entry", "← Prev", show=False),
+        ("x", "toggle_expand", "Expand body"),
+        # Vim-style scrolling fallbacks. The inner VerticalScroll already
+        # handles up/down/pgup/pgdn/home/end when focused, but j/k/d/u are
+        # nicer for terminal users and work even if focus drifts.
+        Binding("j", "scroll_down", "Scroll ↓", show=False),
+        Binding("k", "scroll_up", "Scroll ↑", show=False),
+        Binding("ctrl+d", "page_down", "Page ↓", show=False),
+        Binding("ctrl+u", "page_up", "Page ↑", show=False),
     ]
 
     def __init__(
@@ -66,6 +76,9 @@ class DetailScreen(Screen):
         self.entries = entries
         self.index = index
         self.session_dir = session_dir
+        # When True, request/response bodies and SSE/WS transcripts are
+        # rendered in full instead of being collapsed to the threshold.
+        self._show_full_bodies = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -76,7 +89,7 @@ class DetailScreen(Screen):
     def on_mount(self) -> None:
         self._render_entry()
 
-    def _render_entry(self) -> None:
+    def _render_entry(self, *, scroll_to_top: bool = True) -> None:
         e = self.entry
         mc = _method_colour(e.method)
         sc = _status_colour(e.status)
@@ -135,12 +148,18 @@ class DetailScreen(Screen):
             lines.append("")
             if body_txt:
                 body_lines = body_txt.splitlines()
-                if len(body_lines) > BODY_COLLAPSE_THRESHOLD:
+                if (
+                    not self._show_full_bodies
+                    and len(body_lines) > BODY_COLLAPSE_THRESHOLD
+                ):
                     for bl in body_lines[:BODY_COLLAPSE_THRESHOLD]:
                         lines.append(f"    {_escape(bl)}")
                     remaining = len(body_lines) - BODY_COLLAPSE_THRESHOLD
+                    total = len(body_lines)
                     lines.append(
-                        f"    [dim]… {remaining} more lines (total {len(body_lines)})[/dim]"
+                        f"    [dim]… {remaining} more lines "
+                        f"(total {total}) — press [bold]x[/bold] "
+                        f"to expand[/dim]"
                     )
                 else:
                     for bl in body_lines:
@@ -180,7 +199,10 @@ class DetailScreen(Screen):
             if p.exists():
                 import json
                 ws_lines = p.read_text(errors="replace").splitlines()
-                show = ws_lines[:80]
+                if self._show_full_bodies:
+                    show = ws_lines
+                else:
+                    show = ws_lines[:STREAM_COLLAPSE_THRESHOLD]
                 for sl in show:
                     try:
                         frame = json.loads(sl)
@@ -195,9 +217,14 @@ class DetailScreen(Screen):
                             lines.append(f"      [dim]b64: {_escape(frame['payload_b64'])}[/dim]")
                     except:
                         lines.append(f"    {_escape(sl)}")
-                if len(ws_lines) > 80:
+                if (
+                    not self._show_full_bodies
+                    and len(ws_lines) > STREAM_COLLAPSE_THRESHOLD
+                ):
+                    remaining = len(ws_lines) - STREAM_COLLAPSE_THRESHOLD
                     lines.append(
-                        f"    [dim]… {len(ws_lines) - 80} more lines[/dim]"
+                        f"    [dim]… {remaining} more lines — "
+                        f"press [bold]x[/bold] to expand[/dim]"
                     )
         elif is_stream and stream_path:
             lines.append("")
@@ -207,12 +234,20 @@ class DetailScreen(Screen):
                 p = self.session_dir / p
             if p.exists():
                 sse_lines = p.read_text(errors="replace").splitlines()
-                show = sse_lines[:80]
+                if self._show_full_bodies:
+                    show = sse_lines
+                else:
+                    show = sse_lines[:STREAM_COLLAPSE_THRESHOLD]
                 for sl in show:
                     lines.append(f"    {_escape(sl)}")
-                if len(sse_lines) > 80:
+                if (
+                    not self._show_full_bodies
+                    and len(sse_lines) > STREAM_COLLAPSE_THRESHOLD
+                ):
+                    remaining = len(sse_lines) - STREAM_COLLAPSE_THRESHOLD
                     lines.append(
-                        f"    [dim]… {len(sse_lines) - 80} more lines[/dim]"
+                        f"    [dim]… {remaining} more lines — "
+                        f"press [bold]x[/bold] to expand[/dim]"
                     )
         elif resp_size > 0:
             body_txt, label, decoded = decode_body(
@@ -235,12 +270,18 @@ class DetailScreen(Screen):
             lines.append("")
             if body_txt:
                 body_lines = body_txt.splitlines()
-                if len(body_lines) > BODY_COLLAPSE_THRESHOLD:
+                if (
+                    not self._show_full_bodies
+                    and len(body_lines) > BODY_COLLAPSE_THRESHOLD
+                ):
                     for bl in body_lines[:BODY_COLLAPSE_THRESHOLD]:
                         lines.append(f"    {_escape(bl)}")
                     remaining = len(body_lines) - BODY_COLLAPSE_THRESHOLD
+                    total = len(body_lines)
                     lines.append(
-                        f"    [dim]… {remaining} more lines (total {len(body_lines)})[/dim]"
+                        f"    [dim]… {remaining} more lines "
+                        f"(total {total}) — press [bold]x[/bold] "
+                        f"to expand[/dim]"
                     )
                 else:
                     for bl in body_lines:
@@ -252,9 +293,13 @@ class DetailScreen(Screen):
         content = self.query_one("#detail-content", Static)
         content.update("\n".join(lines))
 
-        # Scroll to top
         scroll = self.query_one("#detail-scroll", VerticalScroll)
-        scroll.scroll_home(animate=False)
+        if scroll_to_top:
+            scroll.scroll_home(animate=False)
+        # Make sure the scroll container is the focused widget so up/down,
+        # PgUp/PgDn, Home/End keys go to it (and not get swallowed by the
+        # screen's other bindings).
+        scroll.focus()
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
@@ -266,10 +311,38 @@ class DetailScreen(Screen):
         if self.index + 1 < len(self.entries):
             self.index += 1
             self.entry = self.entries[self.index]
+            # New entry → reset expand state so we don't accidentally
+            # render a giant body for an unrelated request.
+            self._show_full_bodies = False
             self._render_entry()
 
     def action_prev_entry(self) -> None:
         if self.index > 0:
             self.index -= 1
             self.entry = self.entries[self.index]
+            self._show_full_bodies = False
             self._render_entry()
+
+    def action_toggle_expand(self) -> None:
+        """Toggle full-body / collapsed body rendering for the current entry.
+
+        When expanding, the truncated tail (potentially thousands of lines)
+        is rendered in full so the user can scroll through it. We preserve
+        the scroll position so the toggle feels in-place.
+        """
+        self._show_full_bodies = not self._show_full_bodies
+        self._render_entry(scroll_to_top=False)
+        msg = "Body expanded" if self._show_full_bodies else "Body collapsed"
+        self.notify(msg, severity="information", timeout=1)
+
+    def action_scroll_down(self) -> None:
+        self.query_one("#detail-scroll", VerticalScroll).scroll_down(animate=False)
+
+    def action_scroll_up(self) -> None:
+        self.query_one("#detail-scroll", VerticalScroll).scroll_up(animate=False)
+
+    def action_page_down(self) -> None:
+        self.query_one("#detail-scroll", VerticalScroll).scroll_page_down(animate=False)
+
+    def action_page_up(self) -> None:
+        self.query_one("#detail-scroll", VerticalScroll).scroll_page_up(animate=False)
