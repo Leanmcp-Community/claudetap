@@ -86,4 +86,58 @@ To support `npx`, you have two main options:
 
 ## Usage
 
-*Add documentation on how to use `claudetap` here.*
+Claudetap mints a local root CA, stands up an HTTPS MITM proxy, then launches a
+target with its traffic routed through that proxy and logged to
+`~/.claudetap/sessions/<id>/`.
+
+```bash
+# Tap the Claude Code CLI (default; env-var proxy)
+claudetap                       # launches `claude` under the proxy
+claudetap -- --help             # args after `--` are forwarded to claude
+
+# Tap Windsurf (Electron GUI; Chromium --proxy-server flags)
+claudetap windsurf
+
+# Tap the Antigravity CLI (`agy`, Google's agent CLI)
+claudetap antigravity           # or the alias: claudetap agy
+claudetap agy --agy-bin /path/to/agy
+
+# Tap the OpenAI Codex CLI
+claudetap codex
+claudetap codex -- --help
+
+# Just run the proxy and wire up your own client
+claudetap proxy
+```
+
+### Trusting the CA (required for Antigravity & Windsurf)
+
+`agy` is a Go binary and Windsurf is Chromium-based; both validate TLS against
+the **OS trust store**, not env-var CA bundles. Install the claudetap root CA
+once:
+
+```bash
+claudetap ca trust       # add root CA to the login keychain (macOS)
+claudetap ca untrust     # remove it again
+```
+
+The Claude Code CLI (Node) honors `NODE_EXTRA_CA_CERTS`, so it works without
+OS trust.
+
+### What gets tapped
+
+Each target ships with a default host allow-list (everything else is
+blind-tunneled, not decrypted). Override with `--hosts a.com,*.b.com`.
+
+- **claude** → `api.anthropic.com`, `*.anthropic.com`
+- **codex** → `api.openai.com`, `*.openai.com`, `chatgpt.com`
+- **antigravity** → `cloudcode-pa.googleapis.com`, `aiplatform.googleapis.com`,
+  `*.googleapis.com`, Google auth hosts, and `api.anthropic.com` (Antigravity
+  serves Claude models through Google's Cloud Code backend).
+
+> **Note:** the proxy decrypts HTTP/1.1 only. Google's Cloud Code REST/SSE
+> endpoints work over HTTP/1.1, but any pure-gRPC (HTTP/2) calls are tunneled
+> without decryption. Likewise, the Electron app `agy` can launch over CDP
+> inherits the proxy env vars but Chromium ignores `HTTPS_PROXY` for its own
+> network stack — the core LLM traffic from the `agy` process itself is what
+> gets captured.

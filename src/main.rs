@@ -70,11 +70,45 @@ const WINDSURF_HOSTS: &[&str] = &[
     "generativelanguage.googleapis.com",
 ];
 
+// Antigravity CLI (`agy`) talks to Google's Cloud Code / Gemini Code Assist
+// backend, Vertex AI, and Google auth — plus Anthropic (Antigravity serves
+// Claude models). `*.googleapis.com` is the broad catch-all; the named hosts
+// document the ones observed in the `agy` binary.
+const ANTIGRAVITY_HOSTS: &[&str] = &[
+    // Cloud Code / Gemini Code Assist agent backend (primary LLM traffic)
+    "cloudcode-pa.googleapis.com",
+    "businessaicode.googleapis.com",
+    "aiplatform.googleapis.com",
+    "generativelanguage.googleapis.com",
+    // Google auth / identity
+    "oauth2.googleapis.com",
+    "iamcredentials.googleapis.com",
+    "iam.googleapis.com",
+    "secretmanager.googleapis.com",
+    "www.googleapis.com",
+    // Broad catch-all for any other Google API surface
+    "*.googleapis.com",
+    "*.google.com",
+    // Antigravity also serves Claude models
+    "api.anthropic.com",
+    "*.anthropic.com",
+];
+
+const CODEX_HOSTS: &[&str] = &[
+    "api.openai.com",
+    "*.openai.com",
+    "chatgpt.com",
+    "*.chatgpt.com",
+    "auth.openai.com",
+    "*.oaistatic.com",
+    "*.oaiusercontent.com",
+];
+
 #[derive(Parser, Debug)]
 #[command(
     name = "claudetap",
     version = CLAUDETAP_VERSION,
-    about = "Tap Claude Code's HTTPS traffic into ~/.claudetap (logs are kept forever).",
+    about = "Tap AI tool HTTPS traffic into ~/.claudetap (logs are kept forever).",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -147,6 +181,52 @@ enum Cmd {
         #[arg(last = true)]
         windsurf_args: Vec<OsString>,
     },
+    /// Launch Antigravity under the proxy. By default this runs the `agy`
+    /// terminal CLI (Google's agent CLI). Pass `--gui` to instead launch the
+    /// Antigravity desktop app (the Electron IDE under /Applications).
+    #[command(alias = "agy")]
+    Antigravity {
+        /// Path to the `agy` binary. Defaults to `which agy` and the common
+        /// install locations (~/.local/bin/agy, /usr/local/bin/agy, ...).
+        #[arg(long, value_name = "PATH")]
+        agy_bin: Option<PathBuf>,
+        /// Launch the Antigravity **desktop GUI** (the Electron IDE) under the
+        /// proxy instead of the `agy` terminal CLI. The GUI is Chromium-based,
+        /// so it gets the same `--proxy-server` + CA treatment as Windsurf.
+        #[arg(long, default_value_t = false)]
+        gui: bool,
+        /// (GUI only) Path to the Antigravity desktop app's Electron binary.
+        /// Defaults to /Applications/Antigravity.app/Contents/MacOS/Antigravity.
+        #[arg(long, value_name = "PATH")]
+        gui_bin: Option<PathBuf>,
+        /// (GUI only) Run the GUI with an isolated user-data dir — keeps the
+        /// proxy/CA-tapped launch out of your real Antigravity profile and
+        /// sidesteps Electron's single-instance lock.
+        #[arg(long, value_name = "DIR")]
+        user_data_dir: Option<PathBuf>,
+        /// (GUI only) Skip the OS-trust check for the claudetap root CA.
+        /// Chromium rejects our forged certs without it; debugging only.
+        #[arg(long, default_value_t = false)]
+        skip_trust_check: bool,
+        /// (GUI only) Do NOT kill an already-running Antigravity GUI. Default
+        /// is to terminate it and relaunch under the proxy, because Electron's
+        /// single-instance lock would otherwise forward the launch to the
+        /// existing process and drop our proxy/CA env.
+        #[arg(long, default_value_t = false)]
+        no_restart: bool,
+        /// Forwarded to `agy` (CLI) or the Antigravity GUI after `--`.
+        #[arg(last = true)]
+        agy_args: Vec<OsString>,
+    },
+    /// Launch OpenAI Codex under the proxy.
+    Codex {
+        /// Path to the `codex` binary. Defaults to `which codex`.
+        #[arg(long, value_name = "PATH")]
+        codex_bin: Option<PathBuf>,
+        /// Forwarded to `codex` after `--`.
+        #[arg(last = true)]
+        codex_args: Vec<OsString>,
+    },
     #[command(hide = true)]
     InstallTelemetry,
 }
@@ -196,6 +276,24 @@ fn main() -> Result<()> {
                 .build()
                 .context("building tokio runtime")?;
             rt.block_on(run_windsurf(cli))
+        }
+        Some(Cmd::Antigravity { gui, .. }) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?;
+            if gui {
+                rt.block_on(run_antigravity_gui(cli))
+            } else {
+                rt.block_on(run_antigravity(cli))
+            }
+        }
+        Some(Cmd::Codex { .. }) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?;
+            rt.block_on(run_codex(cli))
         }
         Some(Cmd::Proxy) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -666,7 +764,7 @@ async fn run_windsurf(cli: Cli) -> Result<()> {
 
     write_last_session_pointer(&session_id, &session_dir, &proxy_url)?;
 
-    let mut child = launcher::spawn_windsurf(spec, user_data_dir.as_deref()).await?;
+    let mut child = launcher::spawn_electron(spec, user_data_dir.as_deref()).await?;
     let pid = child.id();
     let spawn_instant = std::time::Instant::now();
 
@@ -737,6 +835,486 @@ async fn run_windsurf(cli: Cli) -> Result<()> {
              \x20         claudetap windsurf --user-data-dir /tmp/wsf-tap\n"
         );
     }
+
+    proxy_task.abort();
+    let _ = proxy_task.await;
+
+    std::process::exit(code.unwrap_or(0));
+}
+
+async fn run_antigravity(cli: Cli) -> Result<()> {
+    let (agy_bin, agy_args) = match cli.command {
+        Some(Cmd::Antigravity {
+            ref agy_bin,
+            ref agy_args,
+            ..
+        }) => (agy_bin.clone(), agy_args.clone()),
+        _ => unreachable!(),
+    };
+    paths::ensure_dir(&paths::root()?)?;
+    paths::ensure_dir(&paths::sessions_dir()?)?;
+    track_install_event();
+
+    let ca = Arc::new(ca::Ca::load_or_generate()?);
+
+    // `agy` is a Go binary. On macOS Go validates TLS against the system
+    // keychain, so without the root CA trusted there every MITM'd request
+    // fails. Warn loudly but don't bail — the user may be on a platform where
+    // an env-var CA bundle is honored, or have trust set up out-of-band.
+    match ca::is_os_trusted()? {
+        Some(true) => {
+            eprintln!("claudetap: root CA is trusted by the OS keychain ✓");
+        }
+        Some(false) => {
+            eprintln!(
+                "\nclaudetap: ⚠  WARNING — root CA is NOT trusted by the OS keychain.\n\
+                 \x20            agy is a Go binary and validates TLS against the system\n\
+                 \x20            trust store; most requests will fail with a cert error.\n\
+                 \x20            Fix: claudetap ca trust    (then re-run)\n\
+                 \x20            Continuing in 2s — Ctrl-C to abort.\n"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        None => {
+            eprintln!(
+                "claudetap: ⚠  cannot verify OS trust on this platform; \
+                 ensure the root CA is trusted or agy will reject requests."
+            );
+        }
+    }
+
+    let session_id = Ulid::new().to_string();
+    let logger = log::SessionLogger::create(session_id.clone(), !cli.no_redact).await?;
+
+    let hosts = if cli.hosts.is_empty() {
+        ANTIGRAVITY_HOSTS.iter().map(|s| s.to_string()).collect()
+    } else {
+        cli.hosts.clone()
+    };
+    let host_filter = proxy::HostFilter::new(hosts.clone());
+
+    let listener = proxy::bind_listener(cli.port).await?;
+    let local = listener.local_addr()?;
+    let proxy_url = format!("http://{}", local);
+
+    let state =
+        proxy::build_state(ca.clone(), logger.clone(), host_filter, cli.passthrough_only_logged)
+            .await?;
+
+    let agy_path = launcher::resolve_antigravity(agy_bin.as_deref())?;
+    let spec = launcher::LaunchSpec {
+        claude_path: agy_path.clone(),
+        args: agy_args.clone(),
+        proxy_url: proxy_url.clone(),
+        session_id: session_id.clone(),
+    };
+
+    let proxy_state = state.clone();
+    let proxy_task = tokio::spawn(async move {
+        if let Err(e) = proxy::run(listener, proxy_state).await {
+            warn!(error = %e, "proxy loop exited");
+        }
+    });
+
+    let session_dir = paths::session_dir(&session_id)?;
+    let ca_path = paths::ca_cert_path()?;
+    let banner_text = banner::Banner::new("claudetap · antigravity")
+        .row("session", session_id.clone())
+        .row("proxy", proxy_url.clone())
+        .row("logs", banner::abbrev_path(&session_dir))
+        .row("hosts", hosts.join(", "))
+        .row("agy", banner::abbrev_path(&agy_path))
+        .render();
+    print!("{}", banner_text);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    write_last_session_pointer(&session_id, &session_dir, &proxy_url)?;
+
+    let mut child = launcher::spawn_antigravity(spec).await?;
+    let pid = child.id();
+
+    let meta = log::SessionMeta {
+        session_id: session_id.clone(),
+        target: "antigravity".to_string(),
+        started_at: OffsetDateTime::now_utc(),
+        ended_at: None,
+        claude_argv: agy_args
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect(),
+        claude_path: agy_path.display().to_string(),
+        claude_pid: pid,
+        claude_exit_code: None,
+        claude_session_id: None,
+        claude_version: None,
+        proxy_addr: local.to_string(),
+        redact: !cli.no_redact,
+        host_filter: hosts,
+        claudetap_version: env!("CARGO_PKG_VERSION").to_string(),
+        session_dir: Some(session_dir.display().to_string()),
+        ca_cert_path: Some(ca_path.display().to_string()),
+        cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        user: std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok()),
+        hostname: hostname(),
+        os: Some(std::env::consts::OS.to_string()),
+        arch: Some(std::env::consts::ARCH.to_string()),
+        shell: std::env::var("SHELL").ok(),
+        term: std::env::var("TERM").ok(),
+        system: Some(collect_system_info()),
+    };
+    logger.write_meta(&meta).await?;
+
+    let code = supervise_child(&mut child, pid).await;
+    if let Err(e) = logger
+        .update_meta(|m| {
+            m.ended_at = Some(OffsetDateTime::now_utc());
+            m.claude_exit_code = code;
+        })
+        .await
+    {
+        warn!(error = %e, "updating meta.json on shutdown");
+    }
+    eprintln!(
+        "\nclaudetap: agy exited (code={}) — session {}\n           logs at {}",
+        code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
+        session_id,
+        session_dir.display()
+    );
+
+    proxy_task.abort();
+    let _ = proxy_task.await;
+
+    std::process::exit(code.unwrap_or(0));
+}
+
+/// Launch the Antigravity **desktop GUI** (the Electron IDE under
+/// /Applications) under the proxy. This is the Chromium-based sibling of the
+/// `agy` CLI: it ignores `HTTP_PROXY` env vars, so it needs the same
+/// `--proxy-server` + OS-trusted-CA + single-instance handling as Windsurf.
+/// Mirrors [`run_windsurf`] with Antigravity-specific binary/process helpers.
+async fn run_antigravity_gui(cli: Cli) -> Result<()> {
+    let (gui_bin, user_data_dir, skip_trust_check, no_restart, gui_args) = match cli.command {
+        Some(Cmd::Antigravity {
+            ref gui_bin,
+            ref user_data_dir,
+            skip_trust_check,
+            no_restart,
+            ref agy_args,
+            ..
+        }) => (
+            gui_bin.clone(),
+            user_data_dir.clone(),
+            skip_trust_check,
+            no_restart,
+            agy_args.clone(),
+        ),
+        _ => unreachable!(),
+    };
+    paths::ensure_dir(&paths::root()?)?;
+    paths::ensure_dir(&paths::sessions_dir()?)?;
+    track_install_event();
+
+    let ca = Arc::new(ca::Ca::load_or_generate()?);
+
+    // Chromium uses the OS trust store. If our CA isn't there, every request
+    // fails with NET::ERR_CERT_AUTHORITY_INVALID. Warn loudly but don't bail.
+    if !skip_trust_check {
+        match ca::is_os_trusted()? {
+            Some(true) => {
+                eprintln!("claudetap: root CA is trusted by the OS keychain ✓");
+            }
+            Some(false) => {
+                eprintln!(
+                    "\nclaudetap: ⚠  WARNING — root CA is NOT trusted by the OS keychain.\n\
+                     \x20            Chromium will reject our forged certs; most Antigravity\n\
+                     \x20            GUI requests will fail with NET::ERR_CERT_AUTHORITY_INVALID.\n\
+                     \x20            Fix: claudetap ca trust    (then re-run)\n\
+                     \x20            Continuing in 2s — Ctrl-C to abort.\n"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            None => {
+                eprintln!(
+                    "claudetap: ⚠  cannot verify OS trust on this platform; \
+                     ensure the root CA is trusted or Chromium will reject requests."
+                );
+            }
+        }
+    }
+
+    if user_data_dir.is_none() && launcher::is_antigravity_gui_running() {
+        if no_restart {
+            return Err(anyhow::anyhow!(
+                "Antigravity is already running and --no-restart was passed. \
+                 Quit it first (⌘Q on macOS), drop --no-restart to let claudetap \
+                 kill and relaunch it, or pass --user-data-dir <fresh> to launch \
+                 an isolated instance."
+            ));
+        }
+        let before = launcher::running_antigravity_pids();
+        eprintln!(
+            "claudetap: Antigravity GUI is already running ({} proc(s)) — terminating it so we \
+             can relaunch under the proxy (pass --no-restart to disable)...",
+            before.len()
+        );
+        let killed = launcher::kill_running_antigravity(std::time::Duration::from_secs(2)).await;
+        // Brief settle delay so the singleton lock file is released.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let survivors = launcher::running_antigravity_pids();
+        if !survivors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "claudetap: signalled {} Antigravity process(es) but {} are still alive: {:?}.\n\
+                 Something is respawning it faster than we can kill it. Try:\n\
+                  - quit Antigravity manually (⌘Q), then re-run claudetap agy --gui;\n\
+                  - run with --user-data-dir /tmp/agy-tap to launch an isolated instance.",
+                killed,
+                survivors.len(),
+                survivors,
+            ));
+        }
+        eprintln!(
+            "claudetap: terminated {} Antigravity process(es); relaunching under the proxy.",
+            killed
+        );
+    }
+
+    let session_id = Ulid::new().to_string();
+    let logger = log::SessionLogger::create(session_id.clone(), !cli.no_redact).await?;
+
+    let hosts = if cli.hosts.is_empty() {
+        ANTIGRAVITY_HOSTS.iter().map(|s| s.to_string()).collect()
+    } else {
+        cli.hosts.clone()
+    };
+    let host_filter = proxy::HostFilter::new(hosts.clone());
+
+    let listener = proxy::bind_listener(cli.port).await?;
+    let local = listener.local_addr()?;
+    let proxy_url = format!("http://{}", local);
+
+    let state =
+        proxy::build_state(ca.clone(), logger.clone(), host_filter, cli.passthrough_only_logged)
+            .await?;
+
+    let gui_path = launcher::resolve_antigravity_gui(gui_bin.as_deref())?;
+    let spec = launcher::LaunchSpec {
+        claude_path: gui_path.clone(),
+        args: gui_args.clone(),
+        proxy_url: proxy_url.clone(),
+        session_id: session_id.clone(),
+    };
+
+    let proxy_state = state.clone();
+    let proxy_task = tokio::spawn(async move {
+        if let Err(e) = proxy::run(listener, proxy_state).await {
+            warn!(error = %e, "proxy loop exited");
+        }
+    });
+
+    let session_dir = paths::session_dir(&session_id)?;
+    let ca_path = paths::ca_cert_path()?;
+    let banner_text = banner::Banner::new("claudetap · antigravity (gui)")
+        .row("session", session_id.clone())
+        .row("proxy", proxy_url.clone())
+        .row("logs", banner::abbrev_path(&session_dir))
+        .row("hosts", hosts.join(", "))
+        .row("gui", banner::abbrev_path(&gui_path))
+        .render();
+    print!("{}", banner_text);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    write_last_session_pointer(&session_id, &session_dir, &proxy_url)?;
+
+    let mut child = launcher::spawn_electron(spec, user_data_dir.as_deref()).await?;
+    let pid = child.id();
+    let spawn_instant = std::time::Instant::now();
+
+    let meta = log::SessionMeta {
+        session_id: session_id.clone(),
+        target: "antigravity-gui".to_string(),
+        started_at: OffsetDateTime::now_utc(),
+        ended_at: None,
+        claude_argv: gui_args
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect(),
+        claude_path: gui_path.display().to_string(),
+        claude_pid: pid,
+        claude_exit_code: None,
+        claude_session_id: None,
+        claude_version: None,
+        proxy_addr: local.to_string(),
+        redact: !cli.no_redact,
+        host_filter: hosts,
+        claudetap_version: env!("CARGO_PKG_VERSION").to_string(),
+        session_dir: Some(session_dir.display().to_string()),
+        ca_cert_path: Some(ca_path.display().to_string()),
+        cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        user: std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok()),
+        hostname: hostname(),
+        os: Some(std::env::consts::OS.to_string()),
+        arch: Some(std::env::consts::ARCH.to_string()),
+        shell: std::env::var("SHELL").ok(),
+        term: std::env::var("TERM").ok(),
+        system: Some(collect_system_info()),
+    };
+    logger.write_meta(&meta).await?;
+
+    let code = supervise_child(&mut child, pid).await;
+    if let Err(e) = logger
+        .update_meta(|m| {
+            m.ended_at = Some(OffsetDateTime::now_utc());
+            m.claude_exit_code = code;
+        })
+        .await
+    {
+        warn!(error = %e, "updating meta.json on shutdown");
+    }
+    let elapsed = spawn_instant.elapsed();
+    eprintln!(
+        "\nclaudetap: antigravity (gui) exited (code={}, after {:.1}s) — session {}\n           logs at {}",
+        code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
+        elapsed.as_secs_f32(),
+        session_id,
+        session_dir.display()
+    );
+
+    // Same single-instance-lock heuristic as Windsurf: an ~instant exit(0)
+    // means the launch was handed off to an existing instance and our proxy/CA
+    // env was dropped.
+    if elapsed < std::time::Duration::from_secs(3) && code == Some(0) {
+        eprintln!(
+            "\nclaudetap: ⚠  antigravity exited almost immediately. Most likely another\n\
+             \x20            Antigravity instance was alive and the new launch was forwarded\n\
+             \x20            to it via Electron's single-instance lock — dropping our proxy/CA.\n\
+             \x20  Try:\n\
+             \x20    1. Fully quit Antigravity, then re-run:\n\
+             \x20         pkill -9 -i antigravity && sleep 1 && claudetap agy --gui\n\
+             \x20    2. Use an isolated profile (bypasses the singleton lock):\n\
+             \x20         claudetap agy --gui --user-data-dir /tmp/agy-tap\n"
+        );
+    }
+
+    proxy_task.abort();
+    let _ = proxy_task.await;
+
+    std::process::exit(code.unwrap_or(0));
+}
+
+async fn run_codex(cli: Cli) -> Result<()> {
+    let (codex_bin, codex_args) = match cli.command {
+        Some(Cmd::Codex {
+            ref codex_bin,
+            ref codex_args,
+        }) => (codex_bin.clone(), codex_args.clone()),
+        _ => unreachable!(),
+    };
+    paths::ensure_dir(&paths::root()?)?;
+    paths::ensure_dir(&paths::sessions_dir()?)?;
+    track_install_event();
+
+    let ca = Arc::new(ca::Ca::load_or_generate()?);
+
+    let session_id = Ulid::new().to_string();
+    let logger = log::SessionLogger::create(session_id.clone(), !cli.no_redact).await?;
+
+    let hosts = if cli.hosts.is_empty() {
+        CODEX_HOSTS.iter().map(|s| s.to_string()).collect()
+    } else {
+        cli.hosts.clone()
+    };
+    let host_filter = proxy::HostFilter::new(hosts.clone());
+
+    let listener = proxy::bind_listener(cli.port).await?;
+    let local = listener.local_addr()?;
+    let proxy_url = format!("http://{}", local);
+
+    let state =
+        proxy::build_state(ca.clone(), logger.clone(), host_filter, cli.passthrough_only_logged)
+            .await?;
+
+    let codex_path = launcher::resolve_codex(codex_bin.as_deref())?;
+    let spec = launcher::LaunchSpec {
+        claude_path: codex_path.clone(),
+        args: codex_args.clone(),
+        proxy_url: proxy_url.clone(),
+        session_id: session_id.clone(),
+    };
+
+    let proxy_state = state.clone();
+    let proxy_task = tokio::spawn(async move {
+        if let Err(e) = proxy::run(listener, proxy_state).await {
+            warn!(error = %e, "proxy loop exited");
+        }
+    });
+
+    let session_dir = paths::session_dir(&session_id)?;
+    let ca_path = paths::ca_cert_path()?;
+    let banner_text = banner::Banner::new("claudetap · codex")
+        .row("session", session_id.clone())
+        .row("proxy", proxy_url.clone())
+        .row("logs", banner::abbrev_path(&session_dir))
+        .row("hosts", hosts.join(", "))
+        .row("codex", banner::abbrev_path(&codex_path))
+        .render();
+    print!("{}", banner_text);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    write_last_session_pointer(&session_id, &session_dir, &proxy_url)?;
+
+    let mut child = launcher::spawn(spec).await?;
+    let pid = child.id();
+
+    let meta = log::SessionMeta {
+        session_id: session_id.clone(),
+        target: "codex".to_string(),
+        started_at: OffsetDateTime::now_utc(),
+        ended_at: None,
+        claude_argv: codex_args
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect(),
+        claude_path: codex_path.display().to_string(),
+        claude_pid: pid,
+        claude_exit_code: None,
+        claude_session_id: None,
+        claude_version: None,
+        proxy_addr: local.to_string(),
+        redact: !cli.no_redact,
+        host_filter: hosts,
+        claudetap_version: env!("CARGO_PKG_VERSION").to_string(),
+        session_dir: Some(session_dir.display().to_string()),
+        ca_cert_path: Some(ca_path.display().to_string()),
+        cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        user: std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok()),
+        hostname: hostname(),
+        os: Some(std::env::consts::OS.to_string()),
+        arch: Some(std::env::consts::ARCH.to_string()),
+        shell: std::env::var("SHELL").ok(),
+        term: std::env::var("TERM").ok(),
+        system: Some(collect_system_info()),
+    };
+    logger.write_meta(&meta).await?;
+
+    let code = supervise_child(&mut child, pid).await;
+    if let Err(e) = logger
+        .update_meta(|m| {
+            m.ended_at = Some(OffsetDateTime::now_utc());
+            m.claude_exit_code = code;
+        })
+        .await
+    {
+        warn!(error = %e, "updating meta.json on shutdown");
+    }
+    eprintln!(
+        "\nclaudetap: codex exited (code={}) — session {}\n           logs at {}",
+        code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
+        session_id,
+        session_dir.display()
+    );
 
     proxy_task.abort();
     let _ = proxy_task.await;
