@@ -10,6 +10,8 @@ class UploadTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         app.DATA = Path(self.tmp.name)
+        app.CONFIG_FILE = str(app.DATA / 'config.yaml')
+        Path(app.CONFIG_FILE).write_text('sync_enabled: true\nmax_session_mib: 200\nmax_chunk_mib: 8\n')
         app.KEY_FILE = str(app.DATA / 'keys.json')
         Path(app.KEY_FILE).write_text(json.dumps({hashlib.sha256(k.encode()).hexdigest(): o for k,o in [('a'*32,'one'),('b'*32,'two')]}))
         self.client = TestClient(app.app)
@@ -52,3 +54,17 @@ class DashboardTests(UploadTests):
         self.assertEqual(a, {'devices':1,'sessions':1,'chunks':1,'stored_bytes':5})
         b = self.client.get('/v1/summary', headers=self.headers(key='b'*32)).json()
         self.assertEqual(b['sessions'],0)
+
+class PolicyTests(UploadTests):
+    def test_policy_reload_and_enforcement(self):
+        cfg = Path(app.CONFIG_FILE)
+        self.assertEqual(self.client.get('/v1/config').status_code, 401)
+        cfg.write_text('sync_enabled: true\nmax_session_mib: 1\nmax_chunk_mib: 8\n')
+        self.assertEqual(self.client.get('/v1/config', headers=self.headers()).json()['max_session_bytes'], 1048576)
+        h = self.headers()
+        h['X-Source-Length'] = '1048576'
+        self.assertEqual(self.client.post('/v1/chunks', headers=h, content=b'hello').status_code, 413)
+        cfg.write_text('sync_enabled: false\nmax_session_mib: 1\nmax_chunk_mib: 8\n')
+        self.assertEqual(self.client.post('/v1/chunks', headers=self.headers(), content=b'hello').status_code, 403)
+        cfg.write_text('invalid: true')
+        self.assertEqual(self.client.get('/v1/config', headers=self.headers()).status_code, 503)

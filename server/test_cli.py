@@ -20,7 +20,7 @@ class CliTest(unittest.TestCase):
             (root/'keys.json').write_text(json.dumps({hashlib.sha256(key.encode()).hexdigest():'test'}))
             with socket.socket() as s:
                 s.bind(('127.0.0.1',0)); port=s.getsockname()[1]
-            env={**os.environ,'CLAUDETAP_HOME':str(root/'client'),'CLAUDETAP_UPLOAD_KEY':key,'CLAUDETAP_DATA':str(root/'data'),'CLAUDETAP_KEYS_FILE':str(root/'keys.json')}
+            env={**os.environ,'CLAUDETAP_HOME':str(root/'client'),'CLAUDETAP_UPLOAD_KEY':key,'CLAUDETAP_CONFIG':str(Path(__file__).resolve().parents[1]/'deploy/config/config.yaml'),'CLAUDETAP_DATA':str(root/'data'),'CLAUDETAP_KEYS_FILE':str(root/'keys.json')}
             import sys
             proc=subprocess.Popen([sys.executable,'-m','uvicorn','app:app','--host','127.0.0.1','--port',str(port)],env=env,cwd=Path(__file__).resolve().parent,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             endpoint=f'http://127.0.0.1:{port}'
@@ -33,7 +33,7 @@ class CliTest(unittest.TestCase):
                 else: self.fail('Server did not start')
                 def cli(*args):
                     return subprocess.run([str(binary),'cloud',*args],env=env,check=True,capture_output=True,text=True)
-                cli('configure','--endpoint',endpoint,'--backfill')
+                cli('configure','--endpoint',endpoint)
                 session='01ARZ3NDEKTSV4RRFFQ69G5FAV'
                 p=root/'client/sessions'/session
                 (p/'stream').mkdir(parents=True)
@@ -41,8 +41,13 @@ class CliTest(unittest.TestCase):
                 (p/'traffic.jsonl').write_text('{"headers":[["Authorization","synthetic-secret"]]}\n')
                 stream=p/'stream/request.sse.jsonl'
                 stream.write_text('{"data":"first"}\n{"data":')
-                cli('sync','--once')
-                cli('sync','--once')
+                first = cli('sync','--once')
+                self.assertIn('Session '+session, first.stderr)
+                self.assertIn('Uploading traffic.jsonl', first.stderr)
+                self.assertIn('Acknowledged traffic.jsonl', first.stderr)
+                self.assertIn('Pending bytes remain', first.stderr)
+                second = cli('sync','--once','--backfill')
+                self.assertIn('No new complete data', second.stderr)
                 headers={'Authorization':'Bearer '+key}
                 sessions=httpx.get(endpoint+'/v1/sessions',headers=headers).json()
                 self.assertEqual(len(sessions),1)

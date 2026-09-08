@@ -21,44 +21,16 @@ cd claudetap
 
 Ensure that `~/.cargo/bin` is in your `$PATH`.
 
-### 2. Homebrew (macOS / Linux)
-
-*Note: To distribute via Homebrew without requiring users to compile from source, you will need to publish compiled binaries (e.g., via GitHub Releases) and create a Homebrew Tap (a repository named `homebrew-claudetap`).*
-
-Once you have set up a Homebrew tap, users can install it like this:
+### 2. Homebrew (macOS)
 
 ```bash
-brew tap ddod/claudetap
-brew install claudetap
+brew tap leanmcp-community/claudetap https://github.com/Leanmcp-Community/claudetap.git
+brew install --HEAD leanmcp-community/claudetap/claudetap
 ```
 
-<details>
-<summary><b>How to set up the Homebrew Formula</b></summary>
-
-In your `homebrew-claudetap` repository, you would create a file called `claudetap.rb`:
-
-```ruby
-class Claudetap < Formula
-  desc "Local HTTPS MITM proxy for Claude Code traffic"
-  homepage "https://github.com/ddod/claudetap"
-  
-  # Option 1: Build from source
-  url "https://github.com/ddod/claudetap/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "REPLACE_WITH_SHA256_OF_TARBALL"
-  license "MIT"
-
-  depends_on "rust" => :build
-
-  def install
-    system "cargo", "install", *std_cargo_args
-  end
-
-  test do
-    system "#{bin}/claudetap", "--version"
-  end
-end
-```
-</details>
+This builds the current source version; Homebrew installs Rust as a build dependency.
+See [Homebrew setup](docs/HOMEBREW.md) for cloud configuration, background services,
+and migration from a Cargo installation.
 
 ### 3. NPX / NPM (For JS/TS developers)
 

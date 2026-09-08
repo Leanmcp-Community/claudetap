@@ -1,0 +1,6 @@
+# Administrator-controlled upload policy. Changes apply on the next sync pass.
+sync_enabled: true
+# Sessions must be strictly smaller than this many MiB (1 MiB = 1048576 bytes).
+max_session_mib: 200
+# Server-side request limit, including filtered/serialized content.
+max_chunk_mib: 8

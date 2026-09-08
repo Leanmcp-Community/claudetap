@@ -47,8 +47,8 @@ Docker Desktop (or Docker Engine with the Compose plugin).
    unset CLAUDETAP_UPLOAD_KEY
    ```
 
-   This enables uploads for **new sessions**. To include existing captures, add
-   `--backfill` to the configure command. Uploads include captured prompts,
+   Sync includes **all existing and new sessions** by default and skips already
+   acknowledged data. `cloud sync --backfill` is also accepted. Uploads include captured prompts,
    responses, and machine metadata. Structured credentials are filtered, but
    arbitrary content and binary bodies can still contain secrets.
 
@@ -158,3 +158,69 @@ claudetap cloud status
 
 The user service automatically starts the uploader during your login lifecycle.
 On macOS, inspect it with `launchctl print gui/$(id -u)/com.claudetap.sync`.
+
+### Sync progress
+
+`claudetap cloud sync` shows a progress bar for each session with new uploads,
+including the current file and acknowledged source bytes. Interactive terminals
+update the current line; redirected output uses plain log lines. Percentages
+refer to the files observed at the beginning of that scan, not the eventual
+size of a live conversation. Filtering may change the actual network byte count.
+Large files continue on subsequent scans; incomplete JSONL lines wait for more
+data. When idle, the worker reports that it is watching for new data. Restart an
+already running uploader after installing an updated CLI to see these messages.
+
+### Session size limit and stopping sync
+
+Only sessions **smaller than 200 MiB** (209,715,200 logical file bytes) are
+eligible for upload. The worker counts all regular files recursively without
+following symlinks, and skips sessions at or above the limit. Size is checked
+on each scan; local data and previously uploaded chunks are preserved.
+
+Stop an existing foreground or background uploader with:
+
+```bash
+claudetap cloud stop
+```
+
+This requests a clean stop after the current request (up to its 30-second
+timeout). It preserves checkpoints. The installed service does not restart a
+successfully stopped worker. Once it has exited, run `claudetap cloud sync` for
+foreground progress, or `python3 deploy/client-service.py install` to restart
+the background service. A new uploader clears the previous stop request.
+
+### Administrator configuration and server files
+
+Edit `deploy/config/config.yaml` on the server host:
+
+```yaml
+sync_enabled: true
+max_session_mib: 200
+max_chunk_mib: 8
+```
+
+Clients fetch the authenticated `/v1/config` policy before every scan. The server
+also rejects uploads when paused or when accumulated session source bytes reach
+the limit. Invalid/missing configuration pauses uploads rather than silently
+using defaults. Changes apply on the next scan/request; no rebuild is needed.
+Size settings use MiB; the protocol currently caps chunks at 8 MiB. Client
+credentials, endpoint, local paths and OS service settings remain local; the
+server policy controls upload eligibility and limits. Existing uploaded data is
+not deleted when a limit is lowered.
+
+- `server/app.py`: ingestion API and dashboard routes.
+- `server/index.html`: web UI.
+- `server/Dockerfile`: server image.
+- `deploy/compose.yaml`: Docker services and persistent mounts.
+- `deploy/config/config.yaml`: administrator policy, mounted read-only at `/etc/claudetap/config.yaml`.
+- `deploy/secrets/keys.json`: organization key hashes, mounted at `/run/secrets/keys.json`.
+- Docker volume `deploy_capture`: uploaded data and indexes, in `/data/capture.sqlite`
+  inside the container (including SQLite WAL files while running).
+
+On Docker Desktop, that volume lives inside Docker's Linux VM, not directly in
+your macOS repository. Inspect it with `docker volume inspect deploy_capture`.
+Do not delete the volume or run `docker compose down -v` unless you intend to
+remove the uploaded data. Local original captures remain under `~/.claudetap/sessions/`.
+
+For the proposed Homebrew installation and `brew services` workflow, see
+[macOS Homebrew setup](docs/HOMEBREW.md). The tap is hosted in `Leanmcp-Community/claudetap`.

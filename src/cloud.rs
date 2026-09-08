@@ -12,7 +12,7 @@ use std::{
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Enable uploads of future sessions. Key is read from CLAUDETAP_UPLOAD_KEY.
+    /// Enable cloud uploads. Key is read from CLAUDETAP_UPLOAD_KEY.
     Configure {
         #[arg(long)]
         endpoint: String,
@@ -20,11 +20,16 @@ pub enum Command {
         backfill: bool,
     },
     Status,
+    /// Stop the running uploader after its current request (up to 30 seconds).
+    Stop,
     Disable,
-    /// Run continuously, or make one pass with --once.
+    /// Sync all existing and new sessions continuously, or make one pass with --once.
     Sync {
         #[arg(long)]
         once: bool,
+        /// Include historical sessions (now the default; accepted for compatibility).
+        #[arg(long)]
+        backfill: bool,
     },
 }
 #[derive(Serialize, Deserialize)]
@@ -114,6 +119,64 @@ fn sanitize(v: &mut Value) {
         _ => {}
     }
 }
+/// Counts source bytes acknowledged by the server, not filtered wire bytes.
+struct Progress {
+    session: String,
+    total: u64,
+    done: u64,
+    active: bool,
+    terminal: bool,
+}
+impl Progress {
+    fn show(&mut self, file: &str) {
+        use std::io::{IsTerminal, Write};
+        self.terminal = std::io::stderr().is_terminal();
+        self.active = true;
+        let fraction = if self.total == 0 {
+            1.0
+        } else {
+            self.done.min(self.total) as f64 / self.total as f64
+        };
+        let filled = (fraction * 20.0) as usize;
+        let line = format!(
+            "Session {} [{}{}] {:3.0}%  {} / {} source bytes  {}",
+            self.session,
+            "=".repeat(filled),
+            "-".repeat(20 - filled),
+            fraction * 100.0,
+            self.done.min(self.total),
+            self.total,
+            file
+        );
+        if self.terminal {
+            eprint!("\r\x1b[2K{line}");
+            let _ = std::io::stderr().flush();
+        } else {
+            eprintln!("{line}");
+        }
+    }
+    fn finish(&mut self) {
+        if self.active {
+            let status = if self.done >= self.total {
+                "Caught up to this scan"
+            } else {
+                "Pending bytes remain; next scan will continue"
+            };
+            self.show(status);
+            if self.terminal {
+                eprintln!();
+            }
+            self.active = false;
+        }
+    }
+}
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if self.active && self.terminal {
+            eprintln!();
+        }
+    }
+}
 pub async fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Configure { endpoint, backfill } => {
@@ -166,6 +229,39 @@ pub async fn run(cmd: Command) -> Result<()> {
             save(&file("cloud.json")?, &c)?;
             println!("Cloud enabled. Captured prompts, bodies and machine metadata will be uploaded. Structured credentials are filtered; arbitrary content may contain secrets. Run claudetap cloud sync.");
         }
+        Command::Stop => {
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let path = file("cloud-sync.lock")?;
+                if !path.exists() {
+                    println!("Uploader is already stopped.");
+                    return Ok(());
+                }
+                let lock = std::fs::OpenOptions::new().write(true).open(path)?;
+                let stopped =
+                    || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+                if stopped() {
+                    println!("Uploader is already stopped.");
+                    return Ok(());
+                }
+                save(&file("cloud-stop.json")?, &true)?;
+                println!("Stopping uploader; waiting for the current request...");
+                for _ in 0..70 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if stopped() {
+                        println!("Uploader stopped. Checkpoints preserved.");
+                        return Ok(());
+                    }
+                }
+                bail!("Stop requested, but worker has not exited after 35 seconds. Inspect its service logs.");
+            }
+            #[cfg(not(unix))]
+            {
+                save(&file("cloud-stop.json")?, &true)?;
+                println!("Stop requested.");
+            }
+        }
         Command::Disable => {
             let mut c = config()?;
             c.enabled = false;
@@ -184,7 +280,7 @@ pub async fn run(cmd: Command) -> Result<()> {
                 s.last_success.as_deref().unwrap_or("never")
             );
         }
-        Command::Sync { once } => {
+        Command::Sync { once, backfill: _ } => {
             // Advisory lock automatically releases after crashes.
             let lock_path = file("cloud-sync.lock")?;
             std::fs::create_dir_all(lock_path.parent().unwrap())?;
@@ -200,13 +296,28 @@ pub async fn run(cmd: Command) -> Result<()> {
                     bail!("Another uploader is running");
                 }
             }
+            let stop_path = file("cloud-stop.json")?;
+            if stop_path.exists() {
+                std::fs::remove_file(&stop_path)?;
+            }
             let client = reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(30))
                 .build()?;
+            eprintln!(
+                "Cloud sync starting. Progress counts acknowledged source bytes per session."
+            );
+            eprintln!(
+                "Syncing existing and new sessions allowed by the administrator policy. Already acknowledged data is skipped."
+            );
+            let mut idle = false;
             let mut delay = 2;
             loop {
+                if stop_path.exists() {
+                    eprintln!("Uploader stopped.");
+                    break;
+                }
                 let c = config()?;
                 if !c.enabled {
                     println!("Cloud disabled");
@@ -214,11 +325,22 @@ pub async fn run(cmd: Command) -> Result<()> {
                 }
                 let result = sync(&client, &c).await;
                 if once {
-                    return result;
+                    return result.map(|uploaded| {
+                        if !uploaded {
+                            eprintln!("No new complete data to upload in eligible sessions.");
+                        }
+                    });
                 }
                 match result {
-                    Ok(()) => delay = 2,
+                    Ok(uploaded) => {
+                        delay = 2;
+                        if uploaded || !idle {
+                            eprintln!("Watching for new data (every 2s). Ctrl-C to stop.");
+                        }
+                        idle = true;
+                    }
                     Err(e) => {
+                        idle = false;
                         eprintln!("Cloud sync paused: {e:#}. Retrying.");
                         delay = (delay * 2).min(60);
                     }
@@ -229,12 +351,57 @@ pub async fn run(cmd: Command) -> Result<()> {
     }
     Ok(())
 }
-async fn sync(client: &reqwest::Client, c: &Config) -> Result<()> {
+#[derive(Deserialize)]
+struct Policy {
+    sync_enabled: bool,
+    max_session_bytes: u64,
+    max_chunk_bytes: u64,
+}
+
+// Count logical file bytes, never following symlinks. Stop as soon as over limit.
+fn session_size(dir: &Path, limit: u64) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.path().symlink_metadata()?;
+        if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        } else if meta.is_dir() {
+            total = total.saturating_add(session_size(&entry.path(), limit)?);
+        }
+        if total >= limit {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+async fn sync(client: &reqwest::Client, c: &Config) -> Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
+    let response = client
+        .get(format!("{}/v1/config", c.endpoint))
+        .bearer_auth(&c.key)
+        .send()
+        .await
+        .context("Cannot fetch administrator policy; uploads paused")?;
+    if !response.status().is_success() {
+        bail!("Cannot fetch administrator policy: {}", response.status());
+    }
+    let policy: Policy = response.json().await?;
+    if !policy.sync_enabled {
+        return Ok(false);
+    }
+    let limit = policy.max_session_bytes;
+    if limit == 0 || policy.max_chunk_bytes < 2 {
+        bail!("Invalid administrator upload limits");
+    }
+    // Leave room for redaction/serialization expansion in structured logs.
+    let chunk_limit = (policy.max_chunk_bytes / 2).min(4 * 1024 * 1024);
     let mut s = state()?;
+    let mut uploaded = false;
     let root = crate::paths::sessions_dir()?;
     if !root.exists() {
-        return Ok(());
+        return Ok(false);
     }
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -242,7 +409,23 @@ async fn sync(client: &reqwest::Client, c: &Config) -> Result<()> {
             continue;
         }
         let session = entry.file_name().to_string_lossy().to_string();
-        if session.parse::<ulid::Ulid>().is_err() || session < c.since {
+        if session.parse::<ulid::Ulid>().is_err() {
+            continue;
+        }
+        if session_size(&entry.path(), limit)? >= limit {
+            static REPORTED: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashSet<String>>,
+            > = std::sync::OnceLock::new();
+            if REPORTED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(session.clone())
+            {
+                eprintln!(
+                    "Skipping session {session}: size is at least the server limit of {} MiB (local files preserved).", limit / 1048576
+                );
+            }
             continue;
         }
         let mut files = vec![
@@ -259,7 +442,35 @@ async fn sync(client: &reqwest::Client, c: &Config) -> Result<()> {
                 }
             }
         }
+        let mut progress = Progress {
+            session: session.clone(),
+            total: 0,
+            done: 0,
+            active: false,
+            terminal: false,
+        };
+        for p in &files {
+            if let Ok(m) = p.symlink_metadata() {
+                if m.is_file() && !m.file_type().is_symlink() {
+                    let rel = p.strip_prefix(entry.path())?.to_string_lossy().to_string();
+                    if rel == "meta.json" || rel.ends_with(".jsonl") || rel.ends_with(".bin") {
+                        progress.total += m.len();
+                        if rel != "meta.json" {
+                            progress.done += s
+                                .offsets
+                                .get(&format!("{session}/{rel}"))
+                                .copied()
+                                .unwrap_or(0)
+                                .min(m.len());
+                        }
+                    }
+                }
+            }
+        }
         for p in files {
+            if file("cloud-stop.json")?.exists() {
+                return Ok(uploaded);
+            }
             if !p
                 .symlink_metadata()
                 .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
@@ -280,7 +491,7 @@ async fn sync(client: &reqwest::Client, c: &Config) -> Result<()> {
             let mut f = std::fs::File::open(&p)?;
             f.seek(SeekFrom::Start(offset))?;
             let mut bytes = Vec::new();
-            f.take(4 * 1024 * 1024).read_to_end(&mut bytes)?;
+            f.take(chunk_limit).read_to_end(&mut bytes)?;
             if bytes.is_empty() {
                 continue;
             }
@@ -288,8 +499,8 @@ async fn sync(client: &reqwest::Client, c: &Config) -> Result<()> {
                 if let Some(n) = bytes.iter().rposition(|b| *b == b'\n') {
                     bytes.truncate(n + 1)
                 } else {
-                    if bytes.len() == 4 * 1024 * 1024 {
-                        bail!("Log line exceeds 4 MiB in {id}");
+                    if bytes.len() as u64 == chunk_limit {
+                        bail!("Log line exceeds administrator chunk limit in {id}");
                     }
                     continue;
                 }
@@ -314,8 +525,10 @@ async fn sync(client: &reqwest::Client, c: &Config) -> Result<()> {
             }
             let checksum = digest(&bytes);
             if meta && s.metadata.get(&id) == Some(&checksum) {
+                progress.done += consumed;
                 continue;
             }
+            progress.show(&format!("Uploading {rel}"));
             let response = client
                 .post(format!("{}/v1/chunks", c.endpoint))
                 .bearer_auth(&c.key)
@@ -339,15 +552,30 @@ async fn sync(client: &reqwest::Client, c: &Config) -> Result<()> {
                 s.offsets.insert(id, offset + consumed);
             }
             save(&file("cloud-state.json")?, &s)?;
+            uploaded = true;
+            progress.done += consumed;
+            progress.show(&format!("Acknowledged {rel}"));
         }
+        progress.finish();
     }
     s.last_success = Some(time::OffsetDateTime::now_utc().to_string());
     save(&file("cloud-state.json")?, &s)?;
-    Ok(())
+    Ok(uploaded)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn size_limit_includes_nested_files_and_exact_boundary() {
+        let dir = std::env::temp_dir().join(format!("claudetap-size-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(dir.join("bodies")).unwrap();
+        let f = std::fs::File::create(dir.join("bodies/large.bin")).unwrap();
+        f.set_len(200 * 1024 * 1024 - 1).unwrap();
+        assert!(session_size(&dir, 200 * 1024 * 1024).unwrap() < 200 * 1024 * 1024);
+        std::fs::write(dir.join("meta.json"), b"x").unwrap();
+        assert!(session_size(&dir, 200 * 1024 * 1024).unwrap() >= 200 * 1024 * 1024);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn filters_nested_credentials() {
         let mut v = serde_json::json!({"headers":[["Authorization","secret"],["Accept","ok"]],"nested":{"api_key":"secret"}});

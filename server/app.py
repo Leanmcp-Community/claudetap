@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import yaml
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
@@ -13,7 +14,28 @@ from fastapi.responses import Response
 app = FastAPI()
 DATA = Path(os.environ.get('CLAUDETAP_DATA', '/data'))
 KEY_FILE = os.environ.get('CLAUDETAP_KEYS_FILE', '/run/secrets/keys.json')
-LIMIT = 8 * 1024 * 1024
+CONFIG_FILE = os.environ.get('CLAUDETAP_CONFIG', '/etc/claudetap/config.yaml')
+
+def policy():
+    try:
+        raw = yaml.safe_load(Path(CONFIG_FILE).read_text())
+        if not isinstance(raw, dict) or set(raw) != {'sync_enabled', 'max_session_mib', 'max_chunk_mib'}:
+            raise ValueError('Expected sync_enabled, max_session_mib and max_chunk_mib')
+        if type(raw['sync_enabled']) is not bool:
+            raise ValueError('sync_enabled must be boolean')
+        for key in ('max_session_mib', 'max_chunk_mib'):
+            if type(raw[key]) is not int or not 1 <= raw[key] <= 1048576:
+                raise ValueError('Size limits must be positive integers, at most 1048576 MiB')
+        if raw['max_chunk_mib'] > 8:
+            raise ValueError('max_chunk_mib cannot exceed the 8 MiB protocol ceiling')
+        return {'sync_enabled':raw['sync_enabled'], 'max_session_bytes':raw['max_session_mib']*1048576, 'max_chunk_bytes':raw['max_chunk_mib']*1048576}
+    except (OSError, ValueError, yaml.YAMLError):
+        raise HTTPException(503, 'Server config.yaml is missing or invalid; contact the administrator')
+
+@app.get('/v1/config')
+def configuration(request: Request):
+    organization(request)
+    return policy()
 
 @contextmanager
 def db():
@@ -58,19 +80,22 @@ def health():
 @app.post('/v1/chunks')
 async def upload(request: Request):
     org = organization(request)
+    limits = policy()
+    if not limits['sync_enabled']:
+        raise HTTPException(403, 'Uploads paused by administrator')
     h = request.headers
     device, session = ident(h.get('x-device', '')), ident(h.get('x-session', ''))
     path = path_name(h.get('x-path', ''))
     try:
         offset, length = int(h['x-offset']), int(h['x-source-length'])
-        if not 0 <= offset < 2**60 or not 0 < length <= LIMIT:
+        if not 0 <= offset < 2**60 or not 0 < length <= limits['max_chunk_bytes']:
             raise ValueError()
     except (KeyError, ValueError):
         raise HTTPException(400, 'Invalid offset or length')
     data = bytearray()
     async for part in request.stream():
         data.extend(part)
-        if len(data) > LIMIT:
+        if len(data) > limits['max_chunk_bytes']:
             raise HTTPException(413, 'Chunk too large')
     checksum = hashlib.sha256(data).hexdigest()
     if checksum != h.get('x-sha256'):
@@ -87,6 +112,10 @@ async def upload(request: Request):
                 raise HTTPException(409, 'Unexpected source offset')
         elif offset != 0:
             raise HTTPException(400, 'Metadata offset must be zero')
+        sizes = dict(conn.execute('SELECT path, MAX(offset+length) FROM chunks WHERE org=? AND device=? AND session=? GROUP BY path', (org, device, session)).fetchall())
+        sizes[path] = max(sizes.get(path, 0), offset + length)
+        if sum(sizes.values()) >= limits['max_session_bytes']:
+            raise HTTPException(413, 'Session exceeds administrator size limit')
         conn.execute('INSERT INTO chunks VALUES (?,?,?,?,?,?,?,?,?)', (*args, offset, length, checksum, h.get('x-hostname', '')[:255], bytes(data)))
     return {'stored': True}
 
