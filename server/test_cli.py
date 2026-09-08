@@ -22,7 +22,7 @@ class CliTest(unittest.TestCase):
                 s.bind(('127.0.0.1',0)); port=s.getsockname()[1]
             env={**os.environ,'CLAUDETAP_HOME':str(root/'client'),'CLAUDETAP_UPLOAD_KEY':key,'CLAUDETAP_DATA':str(root/'data'),'CLAUDETAP_KEYS_FILE':str(root/'keys.json')}
             import sys
-            proc=subprocess.Popen([sys.executable,'-m','uvicorn','app:app','--host','127.0.0.1','--port',str(port)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            proc=subprocess.Popen([sys.executable,'-m','uvicorn','app:app','--host','127.0.0.1','--port',str(port)],env=env,cwd=Path(__file__).resolve().parent,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             endpoint=f'http://127.0.0.1:{port}'
             try:
                 for _ in range(100):

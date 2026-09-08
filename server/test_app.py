@@ -40,3 +40,15 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(r.content,b'{"v":2}')
 
 if __name__ == '__main__': unittest.main()
+
+class DashboardTests(UploadTests):
+    def test_dashboard_and_summary(self):
+        response = self.client.get('/')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('Claudetap', response.text)
+        self.assertEqual(self.client.get('/v1/summary').status_code,401)
+        self.client.post('/v1/chunks', headers=self.headers(), content=b'hello')
+        a = self.client.get('/v1/summary', headers=self.headers()).json()
+        self.assertEqual(a, {'devices':1,'sessions':1,'chunks':1,'stored_bytes':5})
+        b = self.client.get('/v1/summary', headers=self.headers(key='b'*32)).json()
+        self.assertEqual(b['sessions'],0)

@@ -130,3 +130,31 @@ implementation. AWS/GCP deployment scripts have not been exercised against a
 cloud account.
 
 Run `claudetap cloud --help` for the available uploader commands.
+
+### Local management and analysis UI
+
+After starting the server, open **http://127.0.0.1:8080/** and connect with your
+organization upload key. The key is held only in the browser tab's memory.
+The dashboard provides organization totals, paginated/filterable sessions,
+file inspection, chunk downloads, request/error counts and mean request duration
+for the displayed traffic chunk, and a server health check. These are captured
+request metrics, not billing or token estimates. Refresh to see new uploads.
+The UI cannot control the uploader process on another computer; use the CLI or
+service installer for that. Browser identity login, user roles and key management
+remain future work.
+
+To apply UI updates to an already running local server:
+
+```bash
+docker compose -f deploy/compose.yaml up -d --build server
+```
+
+For automatic syncing, configure your key once as above, then run:
+
+```bash
+python3 deploy/client-service.py install
+claudetap cloud status
+```
+
+The user service automatically starts the uploader during your login lifecycle.
+On macOS, inspect it with `launchctl print gui/$(id -u)/com.claudetap.sync`.

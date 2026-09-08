@@ -113,3 +113,15 @@ def download(device: str, session: str, path: str, request: Request, offset: int
     if row is None:
         raise HTTPException(404, 'Chunk not found')
     return Response(row[0], media_type='application/octet-stream', headers={'X-Source-Length': str(row[1]), 'X-SHA256': row[2]})
+
+@app.get('/')
+def dashboard():
+    from fastapi.responses import FileResponse
+    return FileResponse(Path(__file__).with_name('index.html'), headers={'Cache-Control':'no-store'})
+
+@app.get('/v1/summary')
+def summary(request: Request):
+    with db() as conn:
+        org = organization(request)
+        row = conn.execute('SELECT COUNT(DISTINCT device), COUNT(DISTINCT device || session), COUNT(*), COALESCE(SUM(LENGTH(data)),0) FROM chunks WHERE org=?', (org,)).fetchone()
+    return dict(zip(['devices','sessions','chunks','stored_bytes'],row))
