@@ -27,3 +27,8 @@
 **/sessions/
 **/ca/root.key
 **/ca/root.crt
+
+# Cloud server credentials and Python caches
+/deploy/secrets/
+/server/keys.json
+**/__pycache__/

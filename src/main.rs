@@ -13,6 +13,7 @@ use ulid::Ulid;
 
 mod banner;
 mod ca;
+mod cloud;
 mod launcher;
 mod log;
 mod paths;
@@ -143,6 +144,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Configure and run optional cloud uploads.
+    Cloud { #[command(subcommand)] sub: cloud::Command },
     /// CA management.
     Ca {
         #[command(subcommand)]
@@ -253,6 +256,7 @@ fn main() -> Result<()> {
     install_default_crypto_provider()?;
 
     match cli.command {
+        Some(Cmd::Cloud { sub }) => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(cloud::run(sub)),
         Some(Cmd::Where) => {
             println!("{}", paths::root()?.display());
             Ok(())

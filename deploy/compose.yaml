@@ -1,0 +1,23 @@
+services:
+  server:
+    build: ../server
+    restart: unless-stopped
+    volumes:
+      - capture:/data
+      - ./secrets:/run/secrets:ro
+    ports:
+      - '127.0.0.1:8080:8080'
+  tls:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+volumes:
+  capture:
+  caddy:
