@@ -8,7 +8,7 @@ class Claudetap < Formula
   depends_on :macos
 
   def install
-    system "cargo", "install", *std_cargo_args(path: buildpath), "--locked"
+    system "cargo", "install", *std_cargo_args(path: buildpath)
   end
 
   service do
