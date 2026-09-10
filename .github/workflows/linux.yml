@@ -1,0 +1,37 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Test distribution scripts
+        run: python3 -m unittest discover -s tests -v
+      - name: Install stable Rust
+        run: rustup update stable --no-self-update
+      - name: Run tests
+        run: cargo +stable test --locked
+      - name: Verify source installation
+        run: cargo +stable install --path . --locked --root "$RUNNER_TEMP/claudetap-install"
+      - name: Check installed CLI
+        run: |
+          "$RUNNER_TEMP/claudetap-install/bin/claudetap" --version
+          "$RUNNER_TEMP/claudetap-install/bin/claudetap" --help

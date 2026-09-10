@@ -4,57 +4,83 @@ Local HTTPS MITM proxy that taps Claude Code traffic into `~/.claudetap`.
 
 ## Installation
 
-There are several ways to install Claudetap depending on your preference:
+Claudetap is written in Rust. Install from source today using Cargo on Linux or
+macOS. This repository includes Linux binary release and npm publishing tools,
+but those tools do not mean that an npm package or release has been published.
 
-### 1. Cargo (Recommended for Rust users)
+### From source (Linux and macOS)
 
-If you already have Rust and Cargo installed, you can build and install Claudetap directly from source:
+Install a current stable Rust toolchain from [rustup](https://rustup.rs/). On
+Ubuntu/Debian, install the native build prerequisites:
 
 ```bash
-# Clone the repository
-git clone https://github.com/ddod/claudetap.git
-cd claudetap
-
-# Run the install script (which runs `cargo install`)
-./install.sh
+sudo apt-get update
+sudo apt-get install -y build-essential cmake pkg-config ca-certificates
 ```
 
-Ensure that `~/.cargo/bin` is in your `$PATH`.
+Then build and install:
 
-### 2. Homebrew (macOS)
+```bash
+git clone https://github.com/Leanmcp-Community/claudetap.git
+cd claudetap
+cargo install --path . --locked
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+claudetap --version
+```
+
+For an existing checkout, just run `cargo install --path . --locked` again.
+`./install.sh` performs the same Cargo installation and also records an install
+telemetry event. `--locked` uses the dependency versions in `Cargo.lock`.
+
+Install Claude Code separately, then run `claudetap` to launch it through the
+proxy. Linux CI is configured to build and test on x86_64 and ARM64.
+
+### One-line Linux installer (requires publishing this script)
+
+Once `scripts/install-linux.sh` is merged into the repository's `main` branch:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Leanmcp-Community/claudetap/main/scripts/install-linux.sh | bash
+```
+
+This installs to `~/.local/bin` without sudo. It downloads the latest Linux x64
+or ARM64 release and verifies its SHA-256 checksum. Prebuilt binaries target
+glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+); they do not require Rust or Node.js.
+If no binary has been published, it builds from source instead, installing Rust
+if needed. Source builds require the native build prerequisites above.
+
+To build from source explicitly, choose a release, or change the install folder:
+
+```bash
+bash scripts/install-linux.sh --source
+bash scripts/install-linux.sh --version v0.2.0 --prefix "$HOME/.local/bin"
+```
+
+A version must exist as a Git tag or release. Re-run the installer to update;
+remove `~/.local/bin/claudetap` to uninstall the default binary installation.
+
+### Homebrew (macOS)
 
 ```bash
 brew tap leanmcp-community/claudetap https://github.com/Leanmcp-Community/claudetap.git
 brew install --HEAD leanmcp-community/claudetap/claudetap
 ```
 
-This builds the current source version; Homebrew installs Rust as a build dependency.
-See [Homebrew setup](docs/HOMEBREW.md) for cloud configuration, background services,
-and migration from a Cargo installation.
+This builds from source; Homebrew installs Rust as a build dependency.
+See [Homebrew setup](docs/HOMEBREW.md) for cloud configuration and background services.
 
-### 3. NPX / NPM (For JS/TS developers)
+### npm, apt, Snap, and Windows
 
-*Note: Since Claudetap is written in Rust, distributing it via `npm` requires publishing pre-compiled binaries for each architecture to the npm registry.*
+**No npm installation is advertised yet.** Maintainers can use the
+[publishing guide](docs/PUBLISHING.md) to publish Linux x64 and ARM64 binaries
+and an npm launcher. npm is a distribution channel: the application stays Rust,
+and the small JavaScript launcher runs the packaged executable. npm installation
+will require Node.js, while the standalone binary will not.
 
-If published to NPM, you can run Claudetap instantly without installation using:
-
-```bash
-npx claudetap [args...]
-```
-
-Alternatively, install it globally:
-
-```bash
-npm install -g claudetap
-```
-
-<details>
-<summary><b>How to set up NPM distribution</b></summary>
-
-To support `npx`, you have two main options:
-1. **Binary download wrapper:** Create a simple `package.json` with a `postinstall` script (using tools like `binary-install` or a custom JS script) that fetches the compiled binary from GitHub Releases for the user's OS and CPU architecture.
-2. **Platform-specific optional dependencies:** Use a GitHub Action to cross-compile the binary to platforms like `darwin-arm64`, `linux-x64`, etc. Publish each as its own npm package (`@claudetap/core-darwin-arm64`), and have a main `claudetap` npm package that depends on the right binary via `optionalDependencies`. (This is how tools like `esbuild` and `turbo` distribute their binaries).
-</details>
+There is no configured apt repository or Snap package. A Windows `.exe` requires
+a Windows build and platform validation; Linux binaries cannot be renamed to
+`.exe`. Windows release packaging is not configured. See the publishing guide
+for the release process and the distinction between npm packages and executables.
 
 ## Usage
 
@@ -93,8 +119,9 @@ claudetap ca trust       # add root CA to the login keychain (macOS)
 claudetap ca untrust     # remove it again
 ```
 
-The Claude Code CLI (Node) honors `NODE_EXTRA_CA_CERTS`, so it works without
-OS trust.
+The Claude Code launcher sets `NODE_EXTRA_CA_CERTS` for the child process.
+On Linux, `claudetap ca trust` prints manual certificate setup instructions; it
+does not automatically modify certificate stores.
 
 ### What gets tapped
 

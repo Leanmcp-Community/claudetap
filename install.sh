@@ -12,7 +12,7 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 echo ">>> Installing claudetap from ${SCRIPT_DIR}"
-cargo install --path "${SCRIPT_DIR}" --color never "$@"
+cargo install --path "${SCRIPT_DIR}" --locked --color never "$@"
 
 BIN_PATH="${CARGO_HOME:-$HOME/.cargo}/bin/claudetap"
 if [[ -x "${BIN_PATH}" ]]; then

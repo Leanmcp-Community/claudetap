@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+/dist/
+/node_modules/
 **/*.rs.bk
 *.pdb
 HASH

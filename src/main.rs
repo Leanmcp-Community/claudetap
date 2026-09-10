@@ -1430,16 +1430,6 @@ fn uname_r() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-#[cfg(target_os = "linux")]
-fn page_size_bytes() -> Option<u64> {
-    let out = std::process::Command::new("getconf").arg("PAGE_SIZE").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
-}
-
-
 fn track_install_event() {
     let flag_path = paths::root().unwrap_or_else(|_| dirs::home_dir().unwrap().join(".claudetap")).join(".installed");
     if flag_path.exists() {
