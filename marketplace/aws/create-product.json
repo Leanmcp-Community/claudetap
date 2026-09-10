@@ -1,0 +1,10 @@
+{
+  "Catalog": "AWSMarketplace",
+  "ChangeSetName": "Create Claudetap Server draft",
+  "ClientRequestToken": "claudetap-187692046617-initial-product",
+  "ChangeSet": [{
+    "ChangeType": "CreateProduct",
+    "Entity": {"Type": "AmiProduct@1.0"},
+    "DetailsDocument": {"ProductTitle": "Claudetap Server"}
+  }]
+}

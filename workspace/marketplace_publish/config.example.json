@@ -1,0 +1,37 @@
+{
+  "_comment": "Copy to config.json and fill in every FILL_ME. The submit script refuses to run while any remain.",
+
+  "profile": "marketplace",
+  "product_id": "prod-lfxlsiyd4wqnq",
+
+  "ami_id": "FILL_ME_ami_id_in_us_east_1_from_00_prereqs",
+  "access_role_arn": "arn:aws:iam::187692046617:role/AWSMarketplaceAmiIngestion",
+
+  "seller_display_name": "FILL_ME_public_seller_name",
+  "logo_url": "FILL_ME_https_url_to_logo_png_between_120x120_and_640x480",
+  "support_description": "FILL_ME_support_text_including_a_real_support_email_or_url",
+  "support_url": "FILL_ME_https_support_or_docs_url",
+  "refund_policy": "FILL_ME_refund_policy_text_shown_to_buyers",
+
+  "eula": {
+    "_options": "Either {\"type\":\"standard\"} to use the AWS Standard Contract for AWS Marketplace, or {\"type\":\"custom\",\"url\":\"https://.../eula.txt\"} for your own.",
+    "type": "standard"
+  },
+
+  "regions": ["us-east-1", "us-west-2", "eu-west-1"],
+
+  "instance_types": ["t3.small", "t3.medium", "t3.large", "m5.large", "m5.xlarge"],
+  "recommended_instance_type": "t3.small",
+
+  "hourly_prices_usd": {
+    "_comment": "Software price per instance-hour, on top of the buyer's EC2 costs. Must cover every entry in instance_types.",
+    "t3.small": "FILL_ME",
+    "t3.medium": "FILL_ME",
+    "t3.large": "FILL_ME",
+    "m5.large": "FILL_ME",
+    "m5.xlarge": "FILL_ME"
+  },
+
+  "version_title": "1.0.0",
+  "release_notes": "First AWS Marketplace release of the Claudetap capture server."
+}

@@ -1,0 +1,39 @@
+{
+  "profile": "marketplace",
+  "product_id": "prod-lfxlsiyd4wqnq",
+  "ami_id": "ami-01b1063fb6b0be435",
+  "access_role_arn": "arn:aws:iam::187692046617:role/AWSMarketplaceAmiIngestion",
+  "_seller_display_name_note": "Not part of the change set. The public seller name comes from the seller profile in the AWS Marketplace Management Portal. Kept here as a record of the intended name.",
+  "seller_display_name": "Leanmcp",
+  "_logo_url_note": "Must be a direct, publicly readable S3 URL. GitHub raw URLs are rejected with INVALID_MEDIA. Set by 03_upload_logo.sh.",
+  "logo_url": "https://claudetap-marketplace-assets-187692046617.s3.amazonaws.com/logo.png",
+  "support_description": "Email contact@leanmcp.com for support. We answer during business hours on weekdays. Include your instance ID, AWS Region, and the output of 'sudo journalctl -u claudetap -n 200' when reporting a problem.",
+  "support_url": "",
+  "refund_policy": "No refund by default; you pay only for the hours you use. In exceptional cases, such as a defect in the software, we may issue a refund at our discretion. No refunds after 7 days.",
+  "eula": {
+    "type": "standard"
+  },
+  "regions": [
+    "us-east-1",
+    "us-west-2",
+    "eu-west-1"
+  ],
+  "_pricing_rule": "Base rate is $1.40/hour for any instance with fewer than 4 vCPU. At 4 vCPU and above the rate scales proportionally with vCPU count: price = 1.40 * (vCPU / 2). Add new instance types to both lists below using the same rule.",
+  "instance_types": [
+    "t3.small",
+    "t3.medium",
+    "t3.large",
+    "m5.large",
+    "m5.xlarge"
+  ],
+  "recommended_instance_type": "t3.small",
+  "hourly_prices_usd": {
+    "t3.small": "1.40",
+    "t3.medium": "1.40",
+    "t3.large": "1.40",
+    "m5.large": "1.40",
+    "m5.xlarge": "2.80"
+  },
+  "version_title": "1.0.0",
+  "release_notes": "First AWS Marketplace release of the Claudetap capture server."
+}
